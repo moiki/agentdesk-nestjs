@@ -1,0 +1,79 @@
+// AgentDesk — multi-tenant data model.
+//
+// Scoping convention: tenant-owned models keep `id` as a plain @id so service
+// code stays ergonomic (`where: { id }`), but the tenant-scoped Prisma client
+// extension always injects `tenantId` into every operation at runtime. For
+// unique-based operations (findUnique/update/delete/upsert) the injected
+// tenant acts as an extra filter, so a row owned by another tenant simply does
+// not match and the operation fails closed (404/NotFound).
+
+generator client {
+  provider     = "prisma-client"
+  output       = "../src/generated/prisma"
+  moduleFormat = "cjs"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+enum Plan {
+  FREE
+  PRO
+  ENTERPRISE
+}
+
+enum TicketStatus {
+  OPEN
+  IN_PROGRESS
+  RESOLVED
+  CLOSED
+}
+
+enum UserRole {
+  ADMIN
+  MEMBER
+}
+
+/// Tenant registry — NOT tenant-scoped. Created via self-service signup.
+model Tenant {
+  id        String   @id @default(uuid())
+  name      String
+  slug      String   @unique
+  plan      Plan     @default(FREE)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  tickets Ticket[]
+  users   User[]
+}
+
+/// Tenant-owned model. Always accessed through the tenant-scoped client.
+model Ticket {
+  id        String       @id @default(uuid())
+  tenantId  String
+  title     String
+  status    TicketStatus @default(OPEN)
+  createdAt DateTime     @default(now())
+  updatedAt DateTime     @updatedAt
+
+  tenant Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  @@index([tenantId, status])
+  @@index([tenantId, createdAt])
+}
+
+/// Tenant-owned model. Always accessed through the tenant-scoped client.
+model User {
+  id           String   @id @default(uuid())
+  tenantId     String
+  email        String   @unique
+  passwordHash String
+  role         UserRole @default(ADMIN)
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  tenant Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  @@index([tenantId])
+}

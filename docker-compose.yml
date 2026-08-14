@@ -1,0 +1,34 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: agentdesk-postgres
+    environment:
+      POSTGRES_USER: agentdesk
+      POSTGRES_PASSWORD: agentdesk
+      POSTGRES_DB: agentdesk
+    ports:
+      - "5433:5432"
+    volumes:
+      - agentdesk-pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U agentdesk -d agentdesk"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    container_name: agentdesk-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - agentdesk-redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  agentdesk-pgdata:
+  agentdesk-redisdata:

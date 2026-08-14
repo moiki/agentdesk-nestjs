@@ -1,0 +1,13 @@
+node_modules
+# Keep environment variables out of version control
+.env
+.idea/
+dist/
+.vscode/
+/src/generated/prisma
+
+# Prisma CLI transpile cache for prisma.config.ts
+prisma.config.js
+prisma.config.d.ts
+prisma.config.js.map
+*.tsbuildinfo
