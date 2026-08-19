@@ -1,4 +1,5 @@
 node_modules
+pnpm-lock.yaml
 # Keep environment variables out of version control
 .env
 .idea/
@@ -11,3 +12,7 @@ prisma.config.js
 prisma.config.d.ts
 prisma.config.js.map
 *.tsbuildinfo
+
+# Docker
+docker-compose.override.yml
+.DS_Store

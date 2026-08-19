@@ -7,5 +7,6 @@ import { TicketsService } from './tickets.service';
   imports: [TenancyModule],
   controllers: [TicketsController],
   providers: [TicketsService],
+  exports: [TicketsService],
 })
 export class TicketsModule {}

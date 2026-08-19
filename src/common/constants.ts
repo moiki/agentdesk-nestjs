@@ -36,4 +36,12 @@ export const ENV = {
   LLM_PROVIDER: process.env.LLM_PROVIDER ?? 'fake',
   ANTHROPIC_API_KEY: process.env.ANTHROPIC_API_KEY ?? '',
   LLM_MODEL: process.env.LLM_MODEL ?? 'claude-3-5-haiku-latest',
+
+  AGENT_MAX_ITERATIONS: Number(process.env.AGENT_MAX_ITERATIONS ?? 10),
+  AGENT_MAX_TOTAL_TOKENS: Number(process.env.AGENT_MAX_TOTAL_TOKENS ?? 200_000),
+  AGENT_MAX_WALL_CLOCK_MS: Number(
+    process.env.AGENT_MAX_WALL_CLOCK_MS ?? 120_000,
+  ),
+  AGENT_SYSTEM_PROMPT: process.env.AGENT_SYSTEM_PROMPT ?? '',
+  AGENT_LLM_MAX_RETRIES: Number(process.env.AGENT_LLM_MAX_RETRIES ?? 3),
 } as const;

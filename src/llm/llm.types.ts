@@ -24,7 +24,12 @@ export interface ToolDefinition {
 }
 
 export type LlmStopReason =
-  'end_turn' | 'tool_use' | 'max_tokens' | 'stop_sequence' | 'error';
+  | 'end_turn'
+  | 'tool_use'
+  | 'max_tokens'
+  | 'stop_sequence'
+  | 'error'
+  | 'max_iterations';
 
 export interface LlmToolCall {
   id: string;

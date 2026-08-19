@@ -103,6 +103,12 @@ export class FakeLlmProvider implements LlmProvider {
     return this;
   }
 
+  /** Remove all cassettes and recorded requests — useful between e2e tests. */
+  clear(): void {
+    this.cassettes.length = 0;
+    this.requests.length = 0;
+  }
+
   complete(request: LlmRequest): Promise<LlmResponse> {
     this.requests.push(request);
 

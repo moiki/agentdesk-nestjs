@@ -1,0 +1,48 @@
+# Dependencies
+node_modules
+pnpm-lock.yaml
+
+# Build output
+dist
+
+# Environment
+.env
+.env.*
+!.env.example
+
+# IDE
+.idea
+.vscode
+*.swp
+*.swo
+
+# Git
+.git
+.gitignore
+
+# Docker (avoid recursive copy)
+docker-compose*.yml
+Dockerfile
+.dockerignore
+
+# Docs
+*.md
+docs/
+
+# Tests
+test/
+coverage/
+*.spec.ts
+*.e2e-spec.ts
+
+# Prisma migrations (run via docker-compose or CI, not baked into image)
+prisma/migrations/
+
+# Generated Prisma (regenerated at build time)
+src/generated/
+
+# Misc
+*.tsbuildinfo
+prisma.config.js
+prisma.config.d.ts
+prisma.config.js.map

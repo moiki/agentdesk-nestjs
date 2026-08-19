@@ -27,10 +27,11 @@ describe('AgentDesk API smoke (e2e)', () => {
   });
 
   it('exposes a health endpoint without auth', async () => {
-    await request(httpServer)
-      .get('/health')
-      .expect(200)
-      .expect({ status: 'ok' });
+    const res = await request(httpServer).get('/health').expect(200);
+
+    expect(res.body.status).toBe('ok');
+    expect(res.body.db).toBe('connected');
+    expect(res.body.timestamp).toBeDefined();
   });
 
   it('signs a tenant up through the public self-service endpoint', async () => {
