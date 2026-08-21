@@ -50,6 +50,7 @@ El puerto de Postgres es `5433` (no `5432`) porque asume que puede haber un Post
 | PATCH  | `/tickets/:id`   | tenant  | Actualiza ticket propio                             |
 | DELETE | `/tickets/:id`   | tenant  | Elimina ticket propio                               |
 | POST   | `/chat`          | auth    | Agent loop `{ message, conversationHistory?, systemPrompt? }` → respuesta del agente |
+| POST   | `/chat/approve`  | auth    | Reanuda tras pausa de aprobación `{ conversationHistory, decisions }` → respuesta del agente |
 
 La identidad del tenant sale del JWT (`Authorization: Bearer <token>`), nunca del body. Rutas públicas: `/health`, `/signup`, `/auth/login`.
 
@@ -71,7 +72,30 @@ El endpoint `POST /chat` ejecuta un loop agéntico:
 | `list_tickets` | Lista tickets del tenant | `{ status?: TicketStatus }` |
 | `get_ticket` | Lee un ticket por UUID | `{ ticketId: string }` |
 | `update_ticket` | Actualiza title/status | `{ ticketId, title?, status? }` |
-| `delete_ticket` | Elimina un ticket | `{ ticketId: string }` |
+| `delete_ticket` | Elimina un ticket | `{ ticketId: string }` (requiere aprobación) |
+
+### Aprobación humana (`requiresApproval`)
+
+Las tools destructivas (`delete_ticket`) pausan el loop antes de ejecutarse.
+En la pausa, la respuesta incluye `awaitingApproval.toolCalls[]` con los
+argumentos completos; las llamadas seguras de un batch mixto ya se ejecutaron.
+
+El cliente decide con `POST /chat/approve` reenviando el historial que conserva
+más una decisión por call pendiente:
+
+```jsonc
+// POST /chat/approve
+{
+  "conversationHistory": [ /* estado devuelto por la pausa */ ],
+  "decisions": [ { "toolCallId": "call-1", "approved": true } ]
+}
+```
+
+- Aprobada → se ejecuta una vez y el loop continúa hasta `end_turn`.
+- Rechazada → resultado sintético `REJECTED_BY_USER`; nada se elimina.
+- Estado inválido o falsificado → `400` sin llamar al LLM.
+
+Contrato completo para el FE: `docs/spec-02-agent-approval.md`.
 
 ```bash
 AGENT_MAX_ITERATIONS=10      # límite de ciclos del loop

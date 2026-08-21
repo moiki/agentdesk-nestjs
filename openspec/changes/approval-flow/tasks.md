@@ -48,11 +48,11 @@ Chain strategy: stacked-to-main
 
 ## Phase 4: E2E
 
-- [ ] 4.1 Crear `test/agent-approval.e2e-spec.ts`: flujo feliz — chat pausa (cassette delete_ticket) → `awaitingApproval` presente → approve → ticket borrada exactamente una vez → `end_turn`.
-- [ ] 4.2 E2E rechazo: resultado sintético, ticket intacta, mensaje del agente comunica cancelación.
-- [ ] 4.3 E2E negativos: estado falsificado→400; cross-tenant→NOT_FOUND en toolResults; sin JWT→401.
+- [x] 4.1 Crear `test/agent-approval.e2e-spec.ts`: flujo feliz — chat pausa (cassette delete_ticket) → `awaitingApproval` presente → approve → ticket borrada exactamente una vez → `end_turn`.
+- [x] 4.2 E2E rechazo: resultado sintético, ticket intacta, mensaje del agente comunica cancelación.
+- [x] 4.3 E2E negativos: estado falsificado→400; cross-tenant→NOT_FOUND en toolResults; sin JWT→401.
 
 ## Phase 5: Docs
 
-- [ ] 5.1 Crear `docs/spec-02-agent-approval.md` (contrato FE: detección de pausa, payload de decisions, códigos de error).
-- [ ] 5.2 `README.md`: fila `POST /chat/approve` en tabla API + sección approval en Agent loop.
+- [x] 5.1 Crear `docs/spec-02-agent-approval.md` (contrato FE: detección de pausa, payload de decisions, códigos de error).
+- [x] 5.2 `README.md`: fila `POST /chat/approve` en tabla API + sección approval en Agent loop.
