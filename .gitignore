@@ -16,3 +16,4 @@ prisma.config.js.map
 # Docker
 docker-compose.override.yml
 .DS_Store
+coverage/
