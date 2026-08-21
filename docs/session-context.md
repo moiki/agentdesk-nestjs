@@ -17,15 +17,18 @@ Contexto de trabajo para retomar la sesión sin perder nada. Se actualiza al cie
 - ✅ **Agent loop v2** — 10 mejoras de Claude aplicadas: stopReason propio, retry con backoff, errores estructurados, paralelización de tools read-only, truncado de resultados grandes, budget compuesto (tokens+tiempo), idempotencia, requiresApproval, EventEmitter hook.
 - ✅ **pnpm migration** — package-lock.json eliminado, pnpm-lock.yaml generado, `packageManager` field en package.json.
 - ✅ **Docker formal** — Dockerfile multi-stage (deps→build→production), .dockerignore, docker-compose.yml con app + migrate profile, health check con DB connectivity.
-- Verificación verde: build ✓ lint ✓ 71 unit ✓ 33 e2e ✓ `prisma migrate status` ✓.
+- ✅ **SPC-02 Approval flow** (`openspec/specs/agent-approval/`) — pausa explícita `awaitingApproval`, endpoint `POST /chat/approve` con validación anti-falsificación, rechazo sintético `REJECTED_BY_USER`, partición 3-vía (read-only paralelo / mutantes secuenciales / needsApproval pausa). Docs FE en `docs/spec-02-agent-approval.md`.
+- ✅ **Groq provider** (`openspec/specs/groq-provider/`) — `OpenAICompatibleProvider` genérico (chat-completions compatibles), `LLM_PROVIDER=groq`, smoke real `pnpm run test:groq` (pausa→approve→delete contra API Groq). Default `openai/gpt-oss-120b`.
+- Verificación verde: build ✓ lint ✓ **92 unit** ✓ **41 e2e** ✓ `prisma migrate status` ✓.
+- Ambos cambios archivados en `openspec/changes/archive/2026-08-21-*`.
 
 ## Próximo bloque (roadmap)
 
-1. **OpenAI-compatible LLM provider** — Provider genérico que cubra Groq, Together.ai, DeepSeek, Ollama. Instalar `openai` SDK, crear `OpenAICompatibleProvider`, agregar `GROQ_API_KEY` a env vars. Groq gratis: ~30 req/min, llama-3.3-70b.
-2. **Langfuse** — traces + spans + prompt management. EventEmitter2 ya instalado y emitiendo `agent.iteration` y `agent.awaiting_approval`.
-3. Decisión abierta: **streaming** del agent loop (SSE o WebSocket).
-4. **Model tiering** — routing por complejidad/costo.
-5. **Semantic caching** — Redis para respuestas frecuentes.
+1. **Langfuse** — traces + spans + prompt management. EventEmitter2 ya emite `agent.iteration`, `agent.awaiting_approval`, `agent.approval_granted` y `agent.approval_denied`.
+2. Decisión abierta: **streaming** del agent loop (SSE o WebSocket).
+3. **Model tiering** — routing por complejidad/costo.
+4. **Semantic caching** — Redis para respuestas frecuentes.
+5. Infra pendiente: `docker compose up` completo falla construyendo servicio `app` (`pnpm-lock.yaml` no llega al build — revisar `.dockerignore`). Postgres/Redis individuales OK.
 
 ## Decisiones y gotchas (no volver a pisarlas)
 
@@ -52,6 +55,12 @@ Contexto de trabajo para retomar la sesión sin perder nada. Se actualiza al cie
 | 19 | `FakeLlmProvider` sin `clear()` — estado persiste entre tests e2e | `clear()` resetea cassettes y requests array |
 | 20 | `node ./node_modules/.bin/jest` falla con pnpm — `.bin/jest` es shell script, no JS | Usar `NODE_OPTIONS='--experimental-vm-modules' jest` en scripts |
 | 21 | Health check test esperaba `{ status: 'ok' }` pero controlador ahora retorna `{ status, db, timestamp }` | Test debe asserts individuales, no body completo |
+| 22 | `tsx`/esbuild NO sirve para bootstrap de Nest: no emite `design:paramtypes` completo → Nest inyecta `undefined` silenciosamente | Entry points Nest se compilan con `nest build` y corren desde `dist/` (ver `src/scripts/groq-smoke.ts`) |
+| 23 | `cross-env VAR=x cmd1 && cmd2` — la env solo aplica a `cmd1`, no a todo el chain | Env al comando que la necesita: `"a && cross-env VAR=x b"` |
+| 24 | Catálogo Groq cambia: `llama-3.3-70b-versatile` deprecado (2026) → 400 model_not_found | Default `openai/gpt-oss-120b`; ante model_not_found, listar `/openai/v1/models` con la key |
+| 25 | ts-node CJS no resuelve los imports `.js` del cliente Prisma generado (solo jest lo mapea) | Otra razón para compilar scripts standalone a dist (gotcha 22) |
+| 26 | Validación anti-falsificación del approve: pending ≠ "último mensaje assistant" | Detección = toolCalls SIN responder (ids sin mensaje `role:'tool'` correspondiente); necesario para batches mixtos donde resultados seguros siguen al assistant |
+| 27 | `coverage/` estaba trackeada en git — ensuciaba cada diff | Des-indexada + `.gitignore`; si reaparece en diff, es working tree local |
 
 Decisiones de arquitectura: la identidad del tenant sale **solo del JWT**; el modelo `Tenant` es admin (exento de scoping); `TenantScopedPrismaService` es el único camino para dominio de tenant; auth = middleware único como enforcement point (no guard, por orden middleware→guards en NestJS); signup usa transacción + `tenantContextStore.run` envolviendo el `$transaction`. El agent loop es **stateless** (el cliente maneja el historial). `ToolRegistry` es central y extensible (registrar nuevos tools = implementar `Tool` y `register()`). Los tools se declaran con `mutating: true/false` para paralelismo y `requiresApproval: true/false` para aprobación humana. `EventEmitter2` emite eventos por iteración para Langfuse futuro.
 
@@ -61,7 +70,8 @@ Decisiones de arquitectura: la identidad del tenant sale **solo del JWT**; el mo
 - Prisma 7 con generator `prisma-client` CJS → cliente en `src/generated/prisma` (gitignoreado); `prisma.config.ts` importa `ENV` desde `src/common/constants`.
 - `test/setup-env.ts` fuerza `LLM_PROVIDER=fake`, `JWT_SECRET=test-secret`, throttle alto y `DATABASE_URL`→test.
 - e2e: `node --experimental-vm-modules` + config `test/jest-e2e.json` (moduleNameMapper, `maxWorkers: 1`).
-- GitHub Models está **retirado** (jul-2026); para probar flujos de agente: fake cassettes (primario) o Anthropic real.
+- GitHub Models está **retirado** (jul-2026); para probar flujos de agente: fake cassettes (primario), Groq real (`pnpm run test:groq`, requiere `GROQ_API_KEY`) o Anthropic real.
+- Guía para consumidores del backend (FE): **`docs/integration-guide.md`** — contrato completo de endpoints, chat stateless y approval flow.
 
 ## Comandos de verificación
 
@@ -76,10 +86,11 @@ npx prisma migrate status   # valida prisma.config.ts tras cambios de env
 
 ## Archivos relevantes
 
-- `src/agent/` — `agent.module.ts` (EventEmitterModule + LlmModule + TicketsModule + TenancyModule), `agent.service.ts` (orchestrator loop con retry, budget compuesto, paralelización, approval flow), `chat.controller.ts` (`POST /chat`), `dto/chat.dto.ts`.
-- `src/agent/tools/` — `tool.interface.ts` (Tool + ToolResult + ToolErrorCode), `tool-registry.service.ts` (register, getDefinitions, getTool, execute con truncado), `ticket-tools.ts` (5 tools CRUD, mutating + requiresApproval flags).
+- `src/agent/` — `agent.module.ts` (EventEmitterModule + LlmModule + TicketsModule + TenancyModule), `agent.service.ts` (orchestrator loop con retry, budget compuesto, paralelización, `runLoop()`, approval flow + `approve()`), `chat.controller.ts` (`POST /chat`, `POST /chat/approve`), `dto/chat.dto.ts`, `dto/approve-chat.dto.ts`.
+- `src/agent/tools/` — `tool.interface.ts` (Tool + ToolResult + ToolErrorCode con `REJECTED_BY_USER`), `tool-registry.service.ts` (register, getDefinitions, getTool, execute con truncado y safeParse), `ticket-tools.ts` (5 tools CRUD, mutating + requiresApproval flags).
 - `src/health/health.controller.ts` — `GET /health` con check de DB connectivity (usado por Docker healthcheck).
-- `src/llm/` — `llm-provider.interface.ts`, `llm.types.ts` (LlmStopReason incluye `max_iterations`), `tool-schema.ts`, `fake-llm.provider.ts` (cassettes + `clear()`), `anthropic-llm.provider.ts`, `llm.module.ts`.
+- `src/llm/` — `llm-provider.interface.ts`, `llm.types.ts` (LlmStopReason incluye `max_iterations`), `tool-schema.ts`, `fake-llm.provider.ts` (cassettes + `clear()`), `anthropic-llm.provider.ts`, `openai-compatible.provider.ts` (Groq/OpenAI/compatibles; modelo del provider autoritativo), `llm.module.ts` (`createLlmProvider()` exportada: fake | anthropic | groq).
+- `src/scripts/groq-smoke.ts` — smoke real contra Groq (compilado a `dist/scripts/`, NUNCA corre en Jest/CI).
 - `src/auth/` — `auth-context.middleware.ts`, `auth.module.ts`, `auth.service.ts`, `auth.controller.ts`, `auth.types.ts`, `dto/login.dto.ts`.
 - `src/signup/` — dto, service (transacción + P2002→409), controller, module.
 - `src/tenancy/` — `tenant-context.ts` (ALS), `tenant-scoped.prisma.ts` (extensión scoping), `tenant-scoped-prisma.service.ts`.
@@ -88,5 +99,6 @@ npx prisma migrate status   # valida prisma.config.ts tras cambios de env
 - `docker-compose.yml` — services: `postgres`, `redis`, `app` (production), `migrate` (profile: tools).
 - `.dockerignore` — excluye node_modules, dist, .env, tests, docs, migrations.
 - `src/prisma/prisma.service.ts` — cliente raw (plataforma, unscoped).
-- `docs/uc-01-tenant-signup.md`, `docs/spec-01-tenant-signup-auth.md` — specs implementadas.
-- Tests: `test/auth.e2e-spec.ts`, `test/tenant-isolation.e2e-spec.ts`, `test/app.e2e-spec.ts`, `test/llm-provider.e2e-spec.ts`, `test/agent.e2e-spec.ts`, `test/utils.ts` (helpers `createTestApp`, `signupAndAuth`, `asUser`).
+- `docs/uc-01-tenant-signup.md`, `docs/spec-01-tenant-signup-auth.md`, `docs/spec-02-agent-approval.md`, `docs/integration-guide.md` — specs y guía de consumo.
+- `openspec/specs/{agent-approval,groq-provider}/spec.md` — source of truth SDD (changes archivados en `openspec/changes/archive/`).
+- Tests: `test/auth.e2e-spec.ts`, `test/tenant-isolation.e2e-spec.ts`, `test/app.e2e-spec.ts`, `test/llm-provider.e2e-spec.ts`, `test/agent.e2e-spec.ts`, `test/agent-approval.e2e-spec.ts` (8 tests: pausa, approve/reject, falsificación, pipe, cross-tenant, re-pausa encadenada, args Zod inválidos), `test/utils.ts` (helpers `createTestApp`, `signupAndAuth`, `asUser`).
