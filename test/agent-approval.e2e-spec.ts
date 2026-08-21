@@ -300,4 +300,155 @@ describe('Agent approval flow (e2e)', () => {
       ).not.toBeNull();
     });
   });
+
+  it('approve can chain into a new pause when the model requests another approval', async () => {
+    const tenant = await signupAndAuth(httpServer);
+    const created = await request(httpServer)
+      .post('/tickets')
+      .set(asUser(tenant.accessToken))
+      .send({ title: 'First' })
+      .expect(201);
+    const firstId = created.body.id;
+    const second = await request(httpServer)
+      .post('/tickets')
+      .set(asUser(tenant.accessToken))
+      .send({ title: 'Second' })
+      .expect(201);
+    const secondId = second.body.id;
+
+    // Pause #1 on the first ticket
+    const { body: pausedBody, userMessage } = await pauseOnDelete(
+      tenant.accessToken,
+      firstId,
+    );
+
+    // Resume asks for ANOTHER approval-required call → re-pause
+    fakeLlm.add({
+      match: { hasToolCalls: true },
+      response: toolUse('delete_ticket', { ticketId: secondId }),
+    });
+    const resumeRes = await request(httpServer)
+      .post('/chat/approve')
+      .set(asUser(tenant.accessToken))
+      .send({
+        conversationHistory: historyFromPause(userMessage, pausedBody),
+        decisions: [
+          {
+            toolCallId: pausedBody.awaitingApproval.toolCalls[0].id,
+            approved: true,
+          },
+        ],
+      })
+      .expect(201);
+
+    expect(resumeRes.body.stopReason).toBe('tool_use');
+    // First decision materialized: its result is present and side effect happened
+    expect(resumeRes.body.toolResults[0]).toMatchObject({
+      id: pausedBody.awaitingApproval.toolCalls[0].id,
+      success: true,
+    });
+    expect(
+      await prisma.ticket.findUnique({ where: { id: firstId } }),
+    ).toBeNull();
+    // New pending set exposed for the second ticket
+    expect(resumeRes.body.awaitingApproval.toolCalls).toHaveLength(1);
+    expect(resumeRes.body.awaitingApproval.toolCalls[0]).toMatchObject({
+      name: 'delete_ticket',
+      arguments: { ticketId: secondId },
+    });
+    expect(
+      await prisma.ticket.findUnique({ where: { id: secondId } }),
+    ).not.toBeNull();
+
+    // Second decision also works from the re-paused state
+    fakeLlm.clear();
+    fakeLlm.add({
+      match: { hasToolCalls: true },
+      response: endTurn('Both deleted.'),
+    });
+    const history2 = [
+      ...historyFromPause(userMessage, pausedBody),
+      {
+        role: 'tool',
+        content: JSON.stringify(
+          resumeRes.body.toolResults[0].result ?? { deleted: true },
+        ),
+        toolCallId: pausedBody.awaitingApproval.toolCalls[0].id,
+      },
+      {
+        role: 'assistant',
+        content: '',
+        toolCalls: resumeRes.body.awaitingApproval.toolCalls,
+      },
+    ];
+    const finalRes = await request(httpServer)
+      .post('/chat/approve')
+      .set(asUser(tenant.accessToken))
+      .send({
+        conversationHistory: history2,
+        decisions: [
+          {
+            toolCallId: resumeRes.body.awaitingApproval.toolCalls[0].id,
+            approved: true,
+          },
+        ],
+      })
+      .expect(201);
+
+    expect(finalRes.body.stopReason).toBe('end_turn');
+    expect(
+      await prisma.ticket.findUnique({ where: { id: secondId } }),
+    ).toBeNull();
+  });
+
+  it('approve with arguments that fail the Zod schema yields VALIDATION_ERROR without deleting', async () => {
+    const tenant = await signupAndAuth(httpServer);
+    const created = await request(httpServer)
+      .post('/tickets')
+      .set(asUser(tenant.accessToken))
+      .send({ title: 'Survives bad args' })
+      .expect(201);
+    const ticketId = created.body.id;
+
+    fakeLlm.add({
+      match: { hasToolCalls: true },
+      response: endTurn('Could not delete that ticket.'),
+    });
+
+    // Forged-but-plausible pause whose arguments violate z.string().uuid()
+    const badCallId = 'call-bad-args';
+    const res = await request(httpServer)
+      .post('/chat/approve')
+      .set(asUser(tenant.accessToken))
+      .send({
+        conversationHistory: [
+          { role: 'user', content: 'delete it' },
+          {
+            role: 'assistant',
+            content: '',
+            toolCalls: [
+              {
+                id: badCallId,
+                name: 'delete_ticket',
+                arguments: { ticketId: 'not-a-uuid' },
+              },
+            ],
+          },
+        ],
+        decisions: [{ toolCallId: badCallId, approved: true }],
+      })
+      .expect(201);
+
+    expect(res.body.stopReason).toBe('end_turn');
+    expect(res.body.toolResults[0]).toMatchObject({
+      id: badCallId,
+      name: 'delete_ticket',
+      success: false,
+    });
+    expect(res.body.toolResults[0].result.code).toBe('VALIDATION_ERROR');
+    // Schema rejection means zero destructive effect
+    expect(
+      await prisma.ticket.findUnique({ where: { id: ticketId } }),
+    ).not.toBeNull();
+  });
 });

@@ -57,13 +57,15 @@ Promedio changed files: ~90% (unit) — resto verificado a nivel HTTP.
 | Pausa con señal explícita | Tools normales no afectadas | unit triangulación (`awaitingApproval` undefined) + e2e baseline chat | ✅ COMPLIANT |
 | Endpoint de decisión | Approve ejecuta una sola vez | unit `approve() executes…once…end_turn` + e2e approve flow (ticket borrada, end_turn) | ✅ COMPLIANT |
 | Endpoint de decisión | Rechazo produce sintético REJECTED_BY_USER | unit reject + e2e reject (ticket intacta, resultado llega al modelo) | ✅ COMPLIANT |
-| Endpoint de decisión | Re-pausa encadenada | unit re-pause test | ⚠️ PARTIAL (solo unit; sin e2e dedicado) |
+| Endpoint de decisión | Re-pausa encadenada | e2e `approve can chain into a new pause…` (re-pausa + segunda decisión hasta end_turn) | ✅ COMPLIANT |
 | Validación anti-falsificación | Estado falsificado rechazado | 4 unit 400-cases + e2e forged-state (`fakeLlm.requests=0`, cero side-effects) | ✅ COMPLIANT |
-| Validación anti-falsificación | Args re-validados vs schema Zod | transitivo vía `registry.execute()` safeParse (L57); sin test dedicado en ruta approve | ⚠️ PARTIAL |
+| Validación anti-falsificación | Args re-validados vs schema Zod | transitivo vía `registry.execute()` safeParse + e2e `VALIDATION_ERROR without deleting` | ✅ COMPLIANT |
 | Aislamiento multi-tenant | Ticket cross-tenant en approve | e2e cross-tenant (NOT_FOUND a nivel tool, ticket B intacta) | ✅ COMPLIANT |
-| Eventos de observabilidad | Emisión granted/denied | unit eventos por decisión | ⚠️ PARTIAL (solo unit) |
+| Eventos de observabilidad | Emisión granted/denied | unit eventos por decisión | ⚠️ PARTIAL (solo unit; emitter interno, adecuado) |
 
-**Compliance summary:** 6/9 escenarios totalmente compliant · 3 partial (cobertura de capa)
+**Compliance summary:** 8/9 escenarios totalmente compliant · 1 partial aceptado (eventos = capa unit, emitter interno)
+
+> **Post-verify hardening (2026-08-21):** añadidas 2 e2e sugeridas (re-pausa encadenada con doble decisión, y argumentos inválidos → VALIDATION_ERROR sin efecto destructivo). E2E total: **41/41** · Unit: **81/81** · Lint limpio.
 
 ## Coherence (Design)
 | Decisión | ¿Seguida? | Notas |
@@ -83,8 +85,8 @@ Promedio changed files: ~90% (unit) — resto verificado a nivel HTTP.
 **WARNING:** None
 
 **SUGGESTION:**
-1. Añadir e2e para re-pausa encadenada y para argumentos inválidos en approve (hoy solo unit/transitivo).
+1. ~~Añadir e2e para re-pausa encadenada y args inválidos~~ → RESUELTO post-verify (2 tests nuevos).
 2. Infra preexistente fuera de alcance: build Docker del servicio `app` falla (`pnpm-lock.yaml`; revisar `.dockerignore`).
 
 ## Verdict
-**PASS WITH WARNINGS** — 9/9 requisitos implementados y ejecutándose en verde; 3 escenarios con cobertura parcial de capa (unit sin e2e), sin blockers para archive.
+**PASS WITH WARNINGS → PASS** — tras hardening post-verify: 8/9 compliant + eventos unit-only (adecuado). 41 e2e / 81 unit en verde. Sin blockers.
