@@ -1,4 +1,4 @@
-import { Injectable, Logger } from '@nestjs/common';
+import { BadRequestException, Injectable, Logger } from '@nestjs/common';
 import { Inject } from '@nestjs/common';
 import { EventEmitter2 } from '@nestjs/event-emitter';
 import { ENV } from '../common/constants';
@@ -93,6 +93,110 @@ export class AgentService {
       usage: { inputTokens: 0, outputTokens: 0 },
       iterations: 0,
     });
+  }
+
+  /**
+   * Resumes a paused run after a human decision. Stateless by design: the
+   * client sends back the history it received plus one decision per pending
+   * tool call. Approved tools execute here (registry re-validates args);
+   * rejected ones get a synthetic REJECTED_BY_USER result so every tool_use
+   * stays paired with a tool_result in the provider-visible history.
+   */
+  async approve(
+    conversationHistory: ChatMessage[],
+    decisions: { toolCallId: string; approved: boolean }[],
+  ): Promise<ChatResponse> {
+    const messages: ChatMessage[] = conversationHistory.map((m) => ({ ...m }));
+
+    // Pending = assistant toolCalls without an answering role:'tool' message.
+    const answeredIds = new Set(
+      messages.filter((m) => m.role === 'tool').map((m) => m.toolCallId),
+    );
+    const pending: LlmToolCall[] = messages
+      .filter((m) => m.role === 'assistant')
+      .flatMap((m) => m.toolCalls ?? [])
+      .filter((tc) => !answeredIds.has(tc.id));
+
+    if (pending.length === 0) {
+      throw new BadRequestException(
+        'No pending approval tool calls found in conversation history.',
+      );
+    }
+
+    // Decisions must cover the pending set exactly — no missing, extra or
+    // duplicated entries. This is what prevents forged or partial resumes.
+    const decisionById = new Map<string, boolean>();
+    for (const decision of decisions) {
+      if (decisionById.has(decision.toolCallId)) {
+        throw new BadRequestException(
+          `Duplicate decision for toolCallId "${decision.toolCallId}".`,
+        );
+      }
+      decisionById.set(decision.toolCallId, decision.approved);
+    }
+    for (const tc of pending) {
+      if (!decisionById.has(tc.id)) {
+        throw new BadRequestException(`Missing decision for "${tc.id}".`);
+      }
+    }
+    for (const id of decisionById.keys()) {
+      if (!pending.some((tc) => tc.id === id)) {
+        throw new BadRequestException(`Unknown toolCallId "${id}".`);
+      }
+    }
+
+    // Only tools explicitly flagged requiresApproval are decidable here.
+    for (const tc of pending) {
+      const tool = this.registry.getTool(tc.name);
+      if (!tool || tool.requiresApproval !== true) {
+        throw new BadRequestException(
+          `Tool "${tc.name}" is not part of the approval flow.`,
+        );
+      }
+    }
+
+    // The paused turn already consumed one iteration of the budget.
+    const acc: LoopAccumulators = {
+      toolCalls: [],
+      toolResults: [],
+      usage: { inputTokens: 0, outputTokens: 0 },
+      iterations: 1,
+    };
+
+    for (const tc of pending) {
+      acc.toolCalls.push(tc);
+      const approved = decisionById.get(tc.id) === true;
+
+      const result = approved
+        ? await this.registry.execute(tc.name, tc.arguments)
+        : {
+            success: false as const,
+            error: {
+              code: 'REJECTED_BY_USER' as const,
+              message: 'The user denied this action.',
+            },
+          };
+
+      this.eventEmitter.emit(
+        approved ? 'agent.approval_granted' : 'agent.approval_denied',
+        { toolCallId: tc.id, name: tc.name, iteration: acc.iterations },
+      );
+
+      acc.toolResults.push({
+        id: tc.id,
+        name: tc.name,
+        success: result.success,
+        result: result.success ? result.data : result.error,
+      });
+
+      messages.push({
+        role: 'tool',
+        content: JSON.stringify(result.success ? result.data : result.error),
+        toolCallId: tc.id,
+      });
+    }
+
+    return this.runLoop(messages, this.defaultSystemPrompt, acc);
   }
 
   /**

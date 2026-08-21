@@ -1,4 +1,5 @@
 import { Test, TestingModule } from '@nestjs/testing';
+import { BadRequestException } from '@nestjs/common';
 import { AgentService } from './agent.service';
 import { ToolRegistry } from './tools/tool-registry.service';
 import { FakeLlmProvider } from '../llm/fake-llm.provider';
@@ -477,5 +478,239 @@ describe('AgentService', () => {
     await agent.chat('list and create');
     // Read-only runs first (parallel), then mutating
     expect(executionOrder).toEqual(['list', 'create']);
+  });
+
+  describe('approve (resume after approval pause)', () => {
+    let executed: boolean;
+
+    function pausedHistory(): {
+      role: 'user' | 'assistant' | 'tool';
+      content: string;
+      toolCalls?: {
+        id: string;
+        name: string;
+        arguments: Record<string, unknown>;
+      }[];
+      toolCallId?: string;
+    }[] {
+      return [
+        { role: 'user', content: 'delete ticket t9' },
+        {
+          role: 'assistant',
+          content: '',
+          toolCalls: [
+            { id: 'c2', name: 'delete_ticket', arguments: { ticketId: 't9' } },
+          ],
+        },
+      ];
+    }
+
+    function registerDeleteTool(): void {
+      executed = false;
+      registry.register({
+        name: 'delete_ticket',
+        description: 'delete',
+        inputSchema: { safeParse: () => ({ success: true, data: {} }) } as any,
+        requiresApproval: true,
+        mutating: true,
+        execute: () => {
+          executed = true;
+          return Promise.resolve({ success: true, data: { id: 't9' } });
+        },
+      });
+    }
+
+    beforeEach(() => {
+      callCounter = 0;
+      executed = false;
+    });
+
+    it('400 when history has no unanswered assistant toolCalls', async () => {
+      registerDeleteTool();
+      await expect(
+        agent.approve([{ role: 'user', content: 'hi' }], []),
+      ).rejects.toThrow(BadRequestException);
+      expect(executed).toBe(false);
+    });
+
+    it('400 when a decision references an unknown toolCallId', async () => {
+      registerDeleteTool();
+      await expect(
+        agent.approve(pausedHistory(), [
+          { toolCallId: 'other-id', approved: true },
+        ]),
+      ).rejects.toThrow(BadRequestException);
+      expect(executed).toBe(false);
+    });
+
+    it('400 when decisions do not cover the full pending set', async () => {
+      registerDeleteTool();
+      const twoPending = [
+        { role: 'user' as const, content: 'clean up' },
+        {
+          role: 'assistant' as const,
+          content: '',
+          toolCalls: [
+            { id: 'a1', name: 'delete_ticket', arguments: { ticketId: 't1' } },
+            { id: 'a2', name: 'delete_ticket', arguments: { ticketId: 't2' } },
+          ],
+        },
+      ];
+      await expect(
+        agent.approve(twoPending, [{ toolCallId: 'a1', approved: true }]),
+      ).rejects.toThrow(BadRequestException);
+      expect(executed).toBe(false);
+    });
+
+    it('400 when the referenced tool is not registered or lacks requiresApproval', async () => {
+      // Not registered at all
+      await expect(
+        agent.approve(pausedHistory(), [{ toolCallId: 'c2', approved: true }]),
+      ).rejects.toThrow(BadRequestException);
+
+      // Registered but without requiresApproval
+      registry.register({
+        name: 'create_ticket',
+        description: 'create',
+        inputSchema: { safeParse: () => ({ success: true, data: {} }) } as any,
+        execute: () => Promise.resolve({ success: true, data: {} }),
+      });
+      const createPending = [
+        { role: 'user', content: 'make one' },
+        {
+          role: 'assistant' as const,
+          content: '',
+          toolCalls: [
+            { id: 'k1', name: 'create_ticket', arguments: { title: 'x' } },
+          ],
+        },
+      ];
+      await expect(
+        agent.approve(createPending, [{ toolCallId: 'k1', approved: true }]),
+      ).rejects.toThrow(BadRequestException);
+    });
+
+    it('approve executes the tool exactly once and continues until end_turn', async () => {
+      let executeCount = 0;
+      registry.register({
+        name: 'delete_ticket',
+        description: 'delete',
+        inputSchema: { safeParse: () => ({ success: true, data: {} }) } as any,
+        requiresApproval: true,
+        mutating: true,
+        execute: () => {
+          executeCount++;
+          return Promise.resolve({ success: true, data: { id: 't9' } });
+        },
+      });
+      fakeLlm.addCassettes([
+        {
+          match: { hasToolCalls: true },
+          response: endTurnResponse('Deleted the ticket.'),
+        },
+      ]);
+
+      const result = await agent.approve(pausedHistory(), [
+        { toolCallId: 'c2', approved: true },
+      ]);
+
+      expect(executeCount).toBe(1);
+      expect(result.stopReason).toBe('end_turn');
+      expect(result.message).toBe('Deleted the ticket.');
+      expect(result.iterations).toBe(2);
+      expect(result.toolResults[0]).toMatchObject({
+        id: 'c2',
+        name: 'delete_ticket',
+        success: true,
+        result: { id: 't9' },
+      });
+
+      // The real result reached the model as a paired tool message
+      const toolMsgs = fakeLlm.requests[0].messages.filter(
+        (m) => m.role === 'tool',
+      );
+      expect(toolMsgs).toHaveLength(1);
+      expect(toolMsgs[0].toolCallId).toBe('c2');
+      expect(toolMsgs[0].content).toContain('"id":"t9"');
+    });
+
+    it('reject appends a synthetic REJECTED_BY_USER result and never executes', async () => {
+      registerDeleteTool();
+      fakeLlm.addCassettes([
+        {
+          match: { hasToolCalls: true },
+          response: endTurnResponse('Understood, I will not delete it.'),
+        },
+      ]);
+
+      const result = await agent.approve(pausedHistory(), [
+        { toolCallId: 'c2', approved: false },
+      ]);
+
+      expect(executed).toBe(false);
+      expect(result.stopReason).toBe('end_turn');
+      expect(result.toolResults[0]).toMatchObject({
+        id: 'c2',
+        success: false,
+        result: { code: 'REJECTED_BY_USER' },
+      });
+
+      const toolMsgs = fakeLlm.requests[0].messages.filter(
+        (m) => m.role === 'tool',
+      );
+      expect(toolMsgs[0].content).toContain('REJECTED_BY_USER');
+    });
+
+    it('emits approval_granted / approval_denied per decision', async () => {
+      const events: { type: string; payload: unknown }[] = [];
+      eventEmitter.on('agent.approval_granted', (e) =>
+        events.push({ type: 'granted', payload: e }),
+      );
+      eventEmitter.on('agent.approval_denied', (e) =>
+        events.push({ type: 'denied', payload: e }),
+      );
+      registerDeleteTool();
+      fakeLlm.addCassettes([
+        {
+          match: { hasToolCalls: true },
+          response: endTurnResponse('ok'),
+        },
+      ]);
+
+      await agent.approve(pausedHistory(), [
+        { toolCallId: 'c2', approved: false },
+      ]);
+
+      expect(events).toHaveLength(1);
+      expect(events[0].type).toBe('denied');
+      expect(events[0].payload).toMatchObject({
+        toolCallId: 'c2',
+        name: 'delete_ticket',
+      });
+    });
+
+    it('re-pauses when the continuation requests another approval-needing tool', async () => {
+      registerDeleteTool();
+      fakeLlm.addCassettes([
+        {
+          match: { hasToolCalls: true },
+          response: toolUseResponse('delete_ticket', { ticketId: 't8' }),
+        },
+      ]);
+
+      const result = await agent.approve(pausedHistory(), [
+        { toolCallId: 'c2', approved: true },
+      ]);
+
+      expect(result.stopReason).toBe('tool_use');
+      expect(result.awaitingApproval?.toolCalls).toHaveLength(1);
+      expect(result.awaitingApproval?.toolCalls[0]).toMatchObject({
+        name: 'delete_ticket',
+        arguments: { ticketId: 't8' },
+      });
+      // First decision was materialized before the new pause
+      expect(executed).toBe(true);
+      expect(result.toolResults.map((r) => r.id)).toEqual(['c2']);
+    });
   });
 });

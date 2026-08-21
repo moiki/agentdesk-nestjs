@@ -39,12 +39,12 @@ Chain strategy: stacked-to-main
 
 ## Phase 3: Endpoint `/chat/approve` (TDD)
 
-- [ ] 3.1 Crear `src/agent/dto/approve-chat.dto.ts`: `ApproveDecisionDto {toolCallId, approved}`, `ApproveChatDto {conversationHistory, decisions}` con DTOs anidados (`@ValidateNested`).
-- [ ] 3.2 RED: tests unit de validación 400 — historial sin assistant+toolCalls final; `decision.toolCallId` desconocido; decisions incompletas/extras; tool no registrada o sin `requiresApproval`. Verificar que NO se llama al LLM.
-- [ ] 3.3 GREEN: `AgentService.resumeWithDecisions()` — validaciones de 3.2 vía `BadRequestException`.
-- [ ] 3.4 RED/GREEN: materializar decisions — aprobadas via `registry.execute()`, rechazadas como `{success:false, error:{code:'REJECTED_BY_USER'}}`; append `role:'tool'` con `toolCallId`; emitir `agent.approval_granted`/`agent.approval_denied` `{toolCallId, name, iteration}`.
-- [ ] 3.5 Continuar con `runLoop(messages, acc sembrado)` (iterations=1) hasta `end_turn`/nueva pausa/max_iterations; respuesta con mismo shape.
-- [ ] 3.6 `chat.controller.ts`: `@Post('approve')` con `ApproveChatDto`.
+- [x] 3.1 Crear `src/agent/dto/approve-chat.dto.ts`: `ApproveDecisionDto {toolCallId, approved}`, `ApproveChatDto {conversationHistory, decisions}` con DTOs anidados (`@ValidateNested`).
+- [x] 3.2 RED: tests unit de validación 400 — historial sin assistant+toolCalls final; `decision.toolCallId` desconocido; decisions incompletas/extras; tool no registrada o sin `requiresApproval`. Verificar que NO se llama al LLM.
+- [x] 3.3 GREEN: `AgentService.resumeWithDecisions()` — validaciones de 3.2 vía `BadRequestException`.
+- [x] 3.4 RED/GREEN: materializar decisions — aprobadas via `registry.execute()`, rechazadas como `{success:false, error:{code:'REJECTED_BY_USER'}}`; append `role:'tool'` con `toolCallId`; emitir `agent.approval_granted`/`agent.approval_denied` `{toolCallId, name, iteration}`.
+- [x] 3.5 Continuar con `runLoop(messages, acc sembrado)` (iterations=1) hasta `end_turn`/nueva pausa/max_iterations; respuesta con mismo shape.
+- [x] 3.6 `chat.controller.ts`: `@Post('approve')` con `ApproveChatDto`.
 
 ## Phase 4: E2E
 
