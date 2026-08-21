@@ -5,7 +5,8 @@ import { z } from 'zod';
  * recoverable errors (the model can try a different approach) from
  * non-recoverable ones (retrying won't help).
  */
-export type ToolErrorCode = 'NOT_FOUND' | 'VALIDATION_ERROR' | 'INTERNAL_ERROR';
+export type ToolErrorCode =
+  'NOT_FOUND' | 'VALIDATION_ERROR' | 'INTERNAL_ERROR' | 'REJECTED_BY_USER';
 
 export interface ToolError {
   code: ToolErrorCode;

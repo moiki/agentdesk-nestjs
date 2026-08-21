@@ -26,17 +26,26 @@ export interface ChatResponse {
   usage: LlmUsage;
   stopReason: LlmStopReason;
   iterations: number;
+  /** Set when the loop paused waiting for human approval (requiresApproval tools). */
+  awaitingApproval?: PendingApproval;
 }
 
 export interface PendingApproval {
   toolCalls: LlmToolCall[];
-  conversationState: ChatMessage[];
 }
 
 interface LoopBudget {
   maxIterations: number;
   maxTotalTokens: number;
   maxWallClockMs: number;
+}
+
+/** Mutable per-run state accumulated across loop iterations. */
+interface LoopAccumulators {
+  toolCalls: ChatResponse['toolCalls'];
+  toolResults: ToolCallResult[];
+  usage: LlmUsage;
+  iterations: number;
 }
 
 const DEFAULT_SYSTEM_PROMPT = `You are AgentDesk, an AI support agent. You help users manage their support tickets.
@@ -73,47 +82,64 @@ export class AgentService {
     conversationHistory?: ChatMessage[],
     systemPrompt?: string,
   ): Promise<ChatResponse> {
-    const tools = this.registry.getDefinitions();
     const messages: ChatMessage[] = [
       ...(conversationHistory ?? []),
       { role: 'user', content: userMessage },
     ];
 
-    const allToolCalls: ChatResponse['toolCalls'] = [];
-    const allToolResults: ToolCallResult[] = [];
-    const totalUsage: LlmUsage = { inputTokens: 0, outputTokens: 0 };
-    let iterations = 0;
+    return this.runLoop(messages, systemPrompt ?? this.defaultSystemPrompt, {
+      toolCalls: [],
+      toolResults: [],
+      usage: { inputTokens: 0, outputTokens: 0 },
+      iterations: 0,
+    });
+  }
+
+  /**
+   * Core agentic loop. Shared by `chat()` (fresh run) and the approval-resume
+   * flow (seeded accumulators + pre-built message history).
+   */
+  private async runLoop(
+    messages: ChatMessage[],
+    system: string,
+    acc: LoopAccumulators,
+  ): Promise<ChatResponse> {
+    const tools = this.registry.getDefinitions();
     const startTime = Date.now();
 
-    while (iterations < this.budget.maxIterations) {
+    while (acc.iterations < this.budget.maxIterations) {
       // Check composite budget before each LLM call
-      const budgetCheck = this.checkBudget(iterations, totalUsage, startTime);
+      const budgetCheck = this.checkBudget(
+        acc.iterations,
+        acc.usage,
+        startTime,
+      );
       if (budgetCheck) {
         this.logger.warn(`Budget exceeded: ${budgetCheck}`);
         return {
           message: `I stopped early: ${budgetCheck}. Please try a simpler request.`,
-          toolCalls: allToolCalls,
-          toolResults: allToolResults,
-          usage: totalUsage,
+          toolCalls: acc.toolCalls,
+          toolResults: acc.toolResults,
+          usage: acc.usage,
           stopReason: 'max_iterations',
-          iterations,
+          iterations: acc.iterations,
         };
       }
 
-      iterations++;
+      acc.iterations++;
 
       const response = await this.callLlmWithRetry(
         messages,
         tools,
-        systemPrompt ?? this.defaultSystemPrompt,
-        `iteration-${iterations}`,
+        system,
+        `iteration-${acc.iterations}`,
       );
 
-      totalUsage.inputTokens += response.usage.inputTokens;
-      totalUsage.outputTokens += response.usage.outputTokens;
+      acc.usage.inputTokens += response.usage.inputTokens;
+      acc.usage.outputTokens += response.usage.outputTokens;
 
       this.eventEmitter.emit('agent.iteration', {
-        iteration: iterations,
+        iteration: acc.iterations,
         stopReason: response.stopReason,
         toolCallCount: response.toolCalls.length,
         usage: response.usage,
@@ -126,11 +152,11 @@ export class AgentService {
       ) {
         return {
           message: response.content,
-          toolCalls: allToolCalls,
-          toolResults: allToolResults,
-          usage: totalUsage,
+          toolCalls: acc.toolCalls,
+          toolResults: acc.toolResults,
+          usage: acc.usage,
           stopReason: response.stopReason,
-          iterations,
+          iterations: acc.iterations,
         };
       }
 
@@ -141,35 +167,19 @@ export class AgentService {
         toolCalls: response.toolCalls,
       });
 
-      // Check for tools requiring approval — pause and return pending state
-      const needsApproval = response.toolCalls.filter((tc) => {
-        const tool = this.registry.getTool(tc.name);
-        return tool?.requiresApproval === true;
-      });
-
-      if (needsApproval.length > 0) {
-        this.eventEmitter.emit('agent.awaiting_approval', {
-          toolCalls: needsApproval,
-          iteration: iterations,
-        });
-        return {
-          message:
-            'I need your approval before proceeding with the following actions.',
-          toolCalls: [...allToolCalls, ...needsApproval],
-          toolResults: allToolResults,
-          usage: totalUsage,
-          stopReason: 'tool_use',
-          iterations,
-        };
-      }
-
-      // Partition into read-only (safe to parallelize) and mutating (sequential)
+      // Partition into read-only (parallel), mutating (sequential) and
+      // approval-needing (paused, never executed here) tool calls. Safe tools
+      // in a mixed batch still run so the pending set stays fully decidable
+      // and the history keeps every tool_use paired with a tool result.
       const readOnly: LlmToolCall[] = [];
       const mutating: LlmToolCall[] = [];
+      const needsApproval: LlmToolCall[] = [];
 
       for (const tc of response.toolCalls) {
         const tool = this.registry.getTool(tc.name);
-        if (tool?.mutating) {
+        if (tool?.requiresApproval === true) {
+          needsApproval.push(tc);
+        } else if (tool?.mutating) {
           mutating.push(tc);
         } else {
           readOnly.push(tc);
@@ -177,63 +187,14 @@ export class AgentService {
       }
 
       // Execute read-only tools in parallel
-      if (readOnly.length > 0) {
-        const results = await Promise.allSettled(
-          readOnly.map((tc) =>
-            this.registry
-              .execute(tc.name, tc.arguments)
-              .then((r) => ({ tc, result: r })),
-          ),
-        );
-
-        for (const settled of results) {
-          if (settled.status === 'fulfilled') {
-            const { tc, result } = settled.value;
-            allToolCalls.push(tc);
-            allToolResults.push({
-              id: tc.id,
-              name: tc.name,
-              success: result.success,
-              result: result.success ? result.data : result.error,
-            });
-            messages.push({
-              role: 'tool',
-              content: JSON.stringify(
-                result.success ? result.data : result.error,
-              ),
-              toolCallId: tc.id,
-            });
-          } else {
-            // Promise itself rejected (shouldn't happen, but defensive)
-            const tc = readOnly[results.indexOf(settled)];
-            allToolCalls.push(tc);
-            allToolResults.push({
-              id: tc.id,
-              name: tc.name,
-              success: false,
-              result: {
-                code: 'INTERNAL_ERROR',
-                message: 'Tool execution failed unexpectedly',
-              },
-            });
-            messages.push({
-              role: 'tool',
-              content: JSON.stringify({
-                code: 'INTERNAL_ERROR',
-                message: 'Tool execution failed unexpectedly',
-              }),
-              toolCallId: tc.id,
-            });
-          }
-        }
-      }
+      await this.executeReadOnly(readOnly, messages, acc);
 
       // Execute mutating tools sequentially (preserves order + enables idempotency)
       for (const tc of mutating) {
-        allToolCalls.push(tc);
+        acc.toolCalls.push(tc);
 
         const result = await this.registry.execute(tc.name, tc.arguments);
-        allToolResults.push({
+        acc.toolResults.push({
           id: tc.id,
           name: tc.name,
           success: result.success,
@@ -246,6 +207,24 @@ export class AgentService {
           toolCallId: tc.id,
         });
       }
+
+      // Pause AFTER safe execution when destructive tools are pending.
+      if (needsApproval.length > 0) {
+        this.eventEmitter.emit('agent.awaiting_approval', {
+          toolCalls: needsApproval,
+          iteration: acc.iterations,
+        });
+        return {
+          message:
+            'I need your approval before proceeding with the following actions.',
+          toolCalls: [...acc.toolCalls, ...needsApproval],
+          toolResults: acc.toolResults,
+          usage: acc.usage,
+          stopReason: 'tool_use',
+          iterations: acc.iterations,
+          awaitingApproval: { toolCalls: needsApproval },
+        };
+      }
     }
 
     this.logger.warn(
@@ -255,12 +234,69 @@ export class AgentService {
     return {
       message:
         'I reached the maximum number of actions for this request. Please try again with a simpler request.',
-      toolCalls: allToolCalls,
-      toolResults: allToolResults,
-      usage: totalUsage,
+      toolCalls: acc.toolCalls,
+      toolResults: acc.toolResults,
+      usage: acc.usage,
       stopReason: 'max_iterations',
-      iterations,
+      iterations: acc.iterations,
     };
+  }
+
+  /** Executes read-only tools concurrently and records results/messages. */
+  private async executeReadOnly(
+    readOnly: LlmToolCall[],
+    messages: ChatMessage[],
+    acc: LoopAccumulators,
+  ): Promise<void> {
+    if (readOnly.length === 0) return;
+
+    const results = await Promise.allSettled(
+      readOnly.map((tc) =>
+        this.registry
+          .execute(tc.name, tc.arguments)
+          .then((r) => ({ tc, result: r })),
+      ),
+    );
+
+    for (const settled of results) {
+      if (settled.status === 'fulfilled') {
+        const { tc, result } = settled.value;
+        acc.toolCalls.push(tc);
+        acc.toolResults.push({
+          id: tc.id,
+          name: tc.name,
+          success: result.success,
+          result: result.success ? result.data : result.error,
+        });
+        messages.push({
+          role: 'tool',
+          content: JSON.stringify(result.success ? result.data : result.error),
+          toolCallId: tc.id,
+        });
+      } else {
+        // Promise itself rejected (shouldn't happen, but defensive)
+        const index = results.indexOf(settled);
+        const tc = readOnly[index];
+        acc.toolCalls.push(tc);
+        acc.toolResults.push({
+          id: tc.id,
+          name: tc.name,
+          success: false,
+          result: {
+            code: 'INTERNAL_ERROR',
+            message: 'Tool execution failed unexpectedly',
+          },
+        });
+        messages.push({
+          role: 'tool',
+          content: JSON.stringify({
+            code: 'INTERNAL_ERROR',
+            message: 'Tool execution failed unexpectedly',
+          }),
+          toolCallId: tc.id,
+        });
+      }
+    }
   }
 
   private checkBudget(

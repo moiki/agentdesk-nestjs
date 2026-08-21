@@ -1,0 +1,49 @@
+# openspec/config.yaml — AgentDesk SDD config
+schema: spec-driven
+
+context: |
+  Stack: NestJS 11 (Express) · Prisma 7 (adapter-pg, client CJS en src/generated/prisma) · Postgres 16 :5433 + Redis 7 (Docker) · Zod 4 · @anthropic-ai/sdk · pnpm@9.15.9
+  Arquitectura: multi-tenant con AsyncLocalStorage + extensión Prisma que scopea todo modelo tenant-owned; identidad solo del JWT vía AuthContextMiddleware (PUBLIC_PATHS: /health, /signup, /auth/login); agent loop stateless (historial en cliente) con ToolRegistry (schemas Zod → JSON Schema); env centralizado en src/common/constants.ts (objeto ENV); EventEmitter2 para hooks de observabilidad.
+  Testing: Jest 30 unit (ts-jest, rootDir src) + e2e supertest sobre BD de test (test/jest-e2e.json, maxWorkers 1). Verificación: pnpm run build && pnpm run lint && pnpm test && pnpm run test:e2e.
+  Gotchas clave en docs/session-context.md (leer antes de aplicar cambios al loop o a Prisma).
+
+strict_tdd: true
+
+testing:
+  runner:
+    framework: jest
+    command_unit: pnpm test
+    command_e2e: pnpm run test:e2e
+  layers:
+    unit: jest + ts-jest
+    integration_e2e: supertest + Nest testing module (BD real de test)
+  coverage:
+    available: true
+    command: pnpm run test:cov
+  quality:
+    linter: eslint (pnpm run lint)
+    type_checker: tsc via pnpm run build
+    formatter: prettier (pnpm run format)
+
+rules:
+  proposal:
+    - Include rollback plan for risky changes
+    - Identify affected modules/packages
+  specs:
+    - Use Given/When/Then format for scenarios
+    - Use RFC 2119 keywords (MUST, SHALL, SHOULD, MAY)
+  design:
+    - Include sequence diagrams for complex flows
+    - Document architecture decisions with rationale
+  tasks:
+    - Group tasks by phase (infrastructure, implementation, testing)
+    - Use hierarchical numbering (1.1, 1.2, etc.)
+    - Keep tasks small enough to complete in one session
+  apply:
+    - Follow existing code patterns and conventions
+    - Load relevant coding skills for the project stack
+  verify:
+    - Run tests if test infrastructure exists
+    - Compare implementation against every spec scenario
+  archive:
+    - Warn before merging destructive deltas (large removals)

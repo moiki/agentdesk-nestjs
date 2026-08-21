@@ -65,6 +65,7 @@ describe('AgentService', () => {
     expect(result.toolCalls).toHaveLength(0);
     expect(result.iterations).toBe(1);
     expect(result.stopReason).toBe('end_turn');
+    expect(result.awaitingApproval).toBeUndefined();
   });
 
   it('executes a tool call and loops until end_turn', async () => {
@@ -235,6 +236,82 @@ describe('AgentService', () => {
     expect(result.stopReason).toBe('tool_use');
     expect(result.message).toContain('approval');
     expect(result.toolCalls[0].name).toBe('delete_ticket');
+  });
+
+  it('exposes awaitingApproval with full arguments and no side effects on pause', async () => {
+    let executed = false;
+    registry.register({
+      name: 'delete_ticket',
+      description: 'delete',
+      inputSchema: { safeParse: () => ({ success: true, data: {} }) } as any,
+      requiresApproval: true,
+      execute: () => {
+        executed = true;
+        return Promise.resolve({ success: true, data: { id: 't1' } });
+      },
+    });
+
+    fakeLlm.addCassettes([
+      {
+        match: { hasToolCalls: false },
+        response: toolUseResponse('delete_ticket', { ticketId: 't-123' }),
+      },
+    ]);
+
+    const result = await agent.chat('delete ticket t-123');
+    expect(result.awaitingApproval?.toolCalls).toHaveLength(1);
+    expect(result.awaitingApproval?.toolCalls[0]).toEqual({
+      id: 'call-1',
+      name: 'delete_ticket',
+      arguments: { ticketId: 't-123' },
+    });
+    expect(executed).toBe(false);
+  });
+
+  it('executes safe tools and pauses only approval-needing ones in a mixed batch', async () => {
+    let deleted = false;
+    registry.register({
+      name: 'list_tickets',
+      description: 'list',
+      inputSchema: { safeParse: () => ({ success: true, data: {} }) } as any,
+      execute: () => Promise.resolve({ success: true, data: [{ id: 't1' }] }),
+    });
+    registry.register({
+      name: 'delete_ticket',
+      description: 'delete',
+      inputSchema: { safeParse: () => ({ success: true, data: {} }) } as any,
+      requiresApproval: true,
+      execute: () => {
+        deleted = true;
+        return Promise.resolve({ success: true, data: { id: 't9' } });
+      },
+    });
+
+    fakeLlm.addCassettes([
+      {
+        match: { hasToolCalls: false },
+        response: {
+          content: '',
+          toolCalls: [
+            { id: 'c1', name: 'list_tickets', arguments: {} },
+            { id: 'c2', name: 'delete_ticket', arguments: { ticketId: 't9' } },
+          ],
+          stopReason: 'tool_use',
+          usage: { inputTokens: 10, outputTokens: 5 },
+          model: 'fake',
+        },
+      },
+    ]);
+
+    const result = await agent.chat('list then delete');
+    expect(deleted).toBe(false);
+    expect(result.toolResults.map((r) => r.name)).toEqual(['list_tickets']);
+    expect(result.toolResults[0].success).toBe(true);
+    expect(result.awaitingApproval?.toolCalls.map((tc) => tc.id)).toEqual([
+      'c2',
+    ]);
+    expect(result.stopReason).toBe('tool_use');
+    expect(result.message).toContain('approval');
   });
 
   it('uses custom system prompt when provided', async () => {
