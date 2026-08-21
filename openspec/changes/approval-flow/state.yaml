@@ -1,5 +1,5 @@
 change: approval-flow
-status: apply-done
+status: verified
 updated: 2026-08-21
 artifact_store: openspec
 phases:
@@ -8,8 +8,8 @@ phases:
   specs: done        # openspec/changes/approval-flow/specs/agent-approval/spec.md
   design: done       # openspec/changes/approval-flow/design.md
   tasks: done        # openspec/changes/approval-flow/tasks.md
-  apply: pending
-  verify: pending
+  apply: done
+  verify: done
   chain_strategy: stacked-to-main
   archive: pending
 config:

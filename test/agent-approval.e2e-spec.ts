@@ -9,10 +9,7 @@ import { asUser, createTestApp, signupAndAuth } from './utils';
 
 let callId = 0;
 
-function toolUse(
-  toolName: string,
-  args: Record<string, unknown>,
-): LlmResponse {
+function toolUse(toolName: string, args: Record<string, unknown>): LlmResponse {
   callId++;
   return {
     content: '',
@@ -91,7 +88,11 @@ describe('Agent approval flow (e2e)', () => {
   ) {
     return [
       { role: 'user', content: userMessage },
-      { role: 'assistant', content: '', toolCalls: pausedBody.awaitingApproval.toolCalls },
+      {
+        role: 'assistant',
+        content: '',
+        toolCalls: pausedBody.awaitingApproval.toolCalls,
+      },
     ];
   }
 
@@ -127,7 +128,9 @@ describe('Agent approval flow (e2e)', () => {
       arguments: { ticketId },
     });
     // No side effects yet
-    expect(await prisma.ticket.findUnique({ where: { id: ticketId } })).not.toBeNull();
+    expect(
+      await prisma.ticket.findUnique({ where: { id: ticketId } }),
+    ).not.toBeNull();
 
     // Step 2 — approve resumes and completes the deletion
     fakeLlm.add({
@@ -140,7 +143,10 @@ describe('Agent approval flow (e2e)', () => {
       .send({
         conversationHistory: historyFromPause(userMessage, pausedBody),
         decisions: [
-          { toolCallId: pausedBody.awaitingApproval.toolCalls[0].id, approved: true },
+          {
+            toolCallId: pausedBody.awaitingApproval.toolCalls[0].id,
+            approved: true,
+          },
         ],
       })
       .expect(201);
