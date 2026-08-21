@@ -37,6 +37,10 @@ export const ENV = {
   ANTHROPIC_API_KEY: process.env.ANTHROPIC_API_KEY ?? '',
   LLM_MODEL: process.env.LLM_MODEL ?? 'claude-3-5-haiku-latest',
 
+  GROQ_API_KEY: process.env.GROQ_API_KEY ?? '',
+  GROQ_BASE_URL: process.env.GROQ_BASE_URL ?? 'https://api.groq.com/openai/v1',
+  GROQ_MODEL: process.env.GROQ_MODEL ?? 'openai/gpt-oss-120b',
+
   AGENT_MAX_ITERATIONS: Number(process.env.AGENT_MAX_ITERATIONS ?? 10),
   AGENT_MAX_TOTAL_TOKENS: Number(process.env.AGENT_MAX_TOTAL_TOKENS ?? 200_000),
   AGENT_MAX_WALL_CLOCK_MS: Number(

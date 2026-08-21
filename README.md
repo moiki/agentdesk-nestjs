@@ -12,7 +12,7 @@ Multi-tenant scaffolding (Fase 1) + capa de LLM intercambiable (Fase 2) + auth J
 - **Signup self-service**: `POST /signup` crea `Tenant` + `User` (admin) en una transacción; `Tenant.slug` y `email` únicos → `409`; solo plan `FREE` en el MVP.
 - **Modelos**: `Tenant` (registry, admin), `Ticket` (tenant-owned) y `User` (tenant-owned, rol `ADMIN`).
 - **Rate limiting**: guard global `@nestjs/throttler` configurable por env (`THROTTLE_LIMIT`/`THROTTLE_TTL_MS`).
-- **LlmProvider**: interfaz provider-agnóstica (`src/llm/llm-provider.interface.ts`) con `FakeLlmProvider` (cassette, sin red) y `AnthropicLlmProvider` (JSON Schema generado desde Zod vía `z.toJSONSchema`).
+- **LlmProvider**: interfaz provider-agnóstica (`src/llm/llm-provider.interface.ts`) con `FakeLlmProvider` (cassette, sin red), `AnthropicLlmProvider` (JSON Schema generado desde Zod vía `z.toJSONSchema`) y `OpenAICompatibleProvider` (cualquier endpoint chat-completions compatible: Groq, OpenAI, ...).
 - **Tool registry**: `ToolRegistry` centraliza tools (Zod schema → LLM + executor). `TicketTools` registra 5 tools CRUD de tickets.
 - **Agent loop**: `AgentService` orquesta el loop: LLM → tool_use → execute → append results → loop hasta `end_turn` o `maxIterations`. Endpoint `POST /chat`.
 - **Tests**: 56 unit + 33 e2e (auth, signup, scoping, LLM, agent loop, aislamiento cross-tenant via agent).
@@ -109,6 +109,14 @@ El sistema expone un `LlmProvider` intercambiable (DI token `LLM_PROVIDER`):
 ```bash
 LLM_PROVIDER=fake                 # default: cassette, sin red — dev/tests
 LLM_PROVIDER=anthropic            # Anthropic real (requiere ANTHROPIC_API_KEY)
+LLM_PROVIDER=groq                 # Groq vía API OpenAI-compatible (requiere GROQ_API_KEY)
+
+# Solo para groq:
+GROQ_BASE_URL=https://api.groq.com/openai/v1   # default
+GROQ_MODEL=openai/gpt-oss-120b                 # default; debe soportar tool calling
+
+# Smoke test contra el modelo real (NUNCA corre en Jest/CI):
+pnpm run test:groq
 LLM_MODEL=claude-3-5-haiku-latest # modelo por defecto
 ```
 

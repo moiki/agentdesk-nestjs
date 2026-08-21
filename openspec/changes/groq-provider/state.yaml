@@ -1,0 +1,17 @@
+change: groq-provider
+status: applying
+updated: 2026-08-21
+artifact_store: openspec
+phases:
+  explore: skipped   # enfoque aprobado en plan previo (interactive)
+  proposal: done     # openspec/changes/groq-provider/proposal.md
+  specs: done        # openspec/changes/groq-provider/specs/groq-provider/spec.md
+  design: done       # openspec/changes/groq-provider/design.md
+  tasks: done        # openspec/changes/groq-provider/tasks.md (11 tareas)
+  apply: done
+  verify: pending
+  archive: pending
+config:
+  execution_mode: interactive
+  delivery_strategy: ask-on-risk
+  strict_tdd: true
