@@ -1,5 +1,5 @@
 change: groq-provider
-status: verified
+status: archived
 updated: 2026-08-21
 artifact_store: openspec
 phases:
@@ -10,7 +10,7 @@ phases:
   tasks: done        # openspec/changes/groq-provider/tasks.md (11 tareas)
   apply: done
   verify: done
-  archive: pending
+  archive: done
 config:
   execution_mode: interactive
   delivery_strategy: ask-on-risk
