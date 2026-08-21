@@ -1,5 +1,5 @@
 change: approval-flow
-status: verified
+status: archived
 updated: 2026-08-21
 artifact_store: openspec
 phases:
@@ -11,7 +11,7 @@ phases:
   apply: done
   verify: done
   chain_strategy: stacked-to-main
-  archive: pending
+  archive: done
 config:
   execution_mode: interactive
   delivery_strategy: ask-on-risk
