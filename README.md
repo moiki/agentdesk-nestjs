@@ -1,184 +1,169 @@
-# AgentDesk — Agentic AI Gateway multi-tenant en NestJS
+# AgentDesk — Multi-tenant Agentic AI Gateway in NestJS
 
-Backend NestJS que actúa como gateway de agentes de IA para múltiples clientes (tenants): cada tenant tiene su propio agente con tool calling, datos completamente aislados, y todo trazado para observabilidad.
-
-## Estado actual — Agent loop + tool registry
-
-Multi-tenant scaffolding (Fase 1) + capa de LLM intercambiable (Fase 2) + auth JWT + **agent loop con tool calling**:
-
-- **Tenancy**: contexto de tenant propagado vía `AsyncLocalStorage` desde el request hasta cualquier capa (`src/tenancy/tenant-context.ts`).
-- **Row-level isolation**: cliente Prisma con extensión que inyecta `tenantId` en **toda** operación sobre modelos tenant-owned — no hay camino de acceso "sin scope" (`src/tenancy/tenant-scoped.prisma.ts`).
-- **Auth**: `AuthContextMiddleware` (global) verifica el JWT `Authorization: Bearer <token>` y bindea `tenantId`/`userId`/`role` al contexto. La identidad sale **solo del token**; el header `x-tenant-id` es un fallback dev controlado por `ALLOW_TENANT_HEADER=true`.
-- **Signup self-service**: `POST /signup` crea `Tenant` + `User` (admin) en una transacción; `Tenant.slug` y `email` únicos → `409`; solo plan `FREE` en el MVP.
-- **Modelos**: `Tenant` (registry, admin), `Ticket` (tenant-owned) y `User` (tenant-owned, rol `ADMIN`).
-- **Rate limiting**: guard global `@nestjs/throttler` configurable por env (`THROTTLE_LIMIT`/`THROTTLE_TTL_MS`).
-- **LlmProvider**: interfaz provider-agnóstica (`src/llm/llm-provider.interface.ts`) con `FakeLlmProvider` (cassette, sin red), `AnthropicLlmProvider` (JSON Schema generado desde Zod vía `z.toJSONSchema`) y `OpenAICompatibleProvider` (cualquier endpoint chat-completions compatible: Groq, OpenAI, ...).
-- **Tool registry**: `ToolRegistry` centraliza tools (Zod schema → LLM + executor). `TicketTools` registra 5 tools CRUD de tickets.
-- **Agent loop**: `AgentService` orquesta el loop: LLM → tool_use → execute → append results → loop hasta `end_turn` o `maxIterations`. Endpoint `POST /chat`.
-- **Tests**: 56 unit + 33 e2e (auth, signup, scoping, LLM, agent loop, aislamiento cross-tenant via agent).
+NestJS backend that acts as an AI agent gateway for multiple clients (tenants): each tenant has its own agent with tool calling, completely isolated data, and full tracing for observability.
 
 ## Stack
 
 NestJS 11 · Prisma 7 (driver adapter `@prisma/adapter-pg`, generator `prisma-client` CJS) · Postgres 16 + Redis 7 (Docker) · Zod 4 · Anthropic SDK · Jest + Supertest
 
-## Requisitos
+## Requirements
 
-- Node.js 20+ · Docker (con daemon corriendo)
+- Node.js 20+ · Docker (with daemon running)
 
 ## Setup
 
 ```bash
 npm install
 npm run docker:up        # Postgres (localhost:5433) + Redis (localhost:6379)
-npm run db:migrate       # crea/aplica migraciones en la BD dev
-npm run start:dev        # API en http://localhost:3000
+npm run db:migrate       # creates/applies migrations on the dev DB
+npm run start:dev        # API at http://localhost:3000
 ```
 
-El puerto de Postgres es `5433` (no `5432`) porque asume que puede haber un Postgres local en 5432.
+The Postgres port is `5433` (not `5432`) because it assumes there may be a local Postgres on 5432.
 
-## Levantar todo con Docker
+## Running Everything with Docker
 
-El `docker-compose.yml` levanta el stack **completo** (incluida la app NestJS en modo producción) sin necesidad de Node.js local:
+The `docker-compose.yml` runs the **complete** stack (including the NestJS app in production mode) without needing local Node.js:
 
 ```bash
-# 1) Arranca Postgres + Redis + la app (imagen de producción en http://localhost:3000)
+# 1) Start Postgres + Redis + the app (production image at http://localhost:3000)
 docker compose up -d
 
-# 2) Aplica las migraciones de Prisma (one-off, se detiene al terminar)
+# 2) Apply Prisma migrations (one-off, stops when done)
 docker compose --profile tools run --rm migrate
 
-# Ver logs de la app
+# View app logs
 docker compose logs -f app
 ```
 
-Para **actualizar** tras cambiar código o env vars:
+To **update** after changing code or env vars:
 
 ```bash
-docker compose up -d --build        # reconstruye la imagen de la app
+docker compose up -d --build        # rebuilds the app image
 ```
 
-Para **detener**:
+To **stop**:
 
 ```bash
-docker compose down                 # detiene los contenedores
-docker compose down -v              # + elimina los volúmenes (borra la BD y Redis)
+docker compose down                 # stops the containers
+docker compose down -v              # + removes volumes (deletes the DB and Redis)
 ```
 
-### Servicios
+### Services
 
-| Servicio | Imagen | Puerto externo | Notas |
+| Service | Image | External port | Notes |
 |---|---|---|---|
-| `app` | build local (NestJS, multi-stage) | `3000` | Arranca tras el healthcheck de Postgres y Redis |
-| `postgres` | `postgres:16-alpine` | `5433` | Volumen persistente `agentdesk-pgdata` |
-| `redis` | `redis:7-alpine` | `6379` | Volumen persistente `agentdesk-redisdata` |
-| `migrate` | build local | — | One-off (`profile: tools`), solo aplica migraciones y sale |
+| `app` | local build (NestJS, multi-stage) | `3000` | Starts after Postgres and Redis healthcheck |
+| `postgres` | `postgres:16-alpine` | `5433` | Persistent volume `agentdesk-pgdata` |
+| `redis` | `redis:7-alpine` | `6379` | Persistent volume `agentdesk-redisdata` |
+| `migrate` | local build | — | One-off (`profile: tools`), applies migrations and exits |
 
-### Configuración via `.env`
+### Configuration via `.env`
 
-Todas las variables del compose se alimentan del archivo `.env` (crea uno a partir de `.env.example`). Las más relevantes:
+All compose variables are fed from the `.env` file (create one from `.env.example`). Most relevant ones:
 
-| Variable | Default | Descripción |
+| Variable | Default | Description |
 |---|---|---|
-| `PORT` | `3000` | Puerto de la app |
-| `CORS_ORIGINS` | `*` | Orígenes permitidos (comma-separated). Para dev con FE en localhost:5173 → `http://localhost:5173` |
+| `PORT` | `3000` | App port |
+| `CORS_ORIGINS` | `*` | Allowed origins (comma-separated). For dev with FE on localhost:5173 → `http://localhost:5173` |
 | `LLM_PROVIDER` | `fake` | `fake` / `anthropic` / `groq` |
-| `GROQ_API_KEY` | — | Requerida si `LLM_PROVIDER=groq` |
-| `ANTHROPIC_API_KEY` | — | Requerida si `LLM_PROVIDER=anthropic` |
-| `DATABASE_URL` | apunta a `postgres` interno | Compuesta automáticamente desde `POSTGRES_*` |
+| `GROQ_API_KEY` | — | Required if `LLM_PROVIDER=groq` |
+| `ANTHROPIC_API_KEY` | — | Required if `LLM_PROVIDER=anthropic` |
+| `DATABASE_URL` | points to internal `postgres` | Composed automatically from `POSTGRES_*` |
 
-> Nota: la app espera a que Postgres y Redis pasen su healthcheck antes de arrancar (`depends_on: condition: service_healthy`). Si la app crashea al inicio, revisa `docker compose logs app`.
+> Note: the app waits for Postgres and Redis to pass their healthcheck before starting (`depends_on: condition: service_healthy`). If the app crashes at startup, check `docker compose logs app`.
 
 ## API
 
-| Método | Ruta             | Scope   | Descripción                                         |
+| Method | Route            | Scope   | Description                                        |
 |--------|------------------|---------|-----------------------------------------------------|
-| GET    | `/health`        | público | Health check                                        |
-| POST   | `/signup`        | público | Onboarding self-service `{ companyName, workspaceName, adminEmail, adminPassword, plan? }` |
-| POST   | `/auth/login`    | público | Login `{ email, password }` → `{ accessToken }`     |
-| GET    | `/auth/me`       | auth    | Perfil del usuario + tenant (`role`, `plan`, ...)    |
-| POST   | `/tickets`       | tenant  | Crea un ticket `{ title }`                          |
-| GET    | `/tickets`       | tenant  | Lista tickets del tenant activo (`?status=`)        |
-| GET    | `/tickets/:id`   | tenant  | Lee ticket propio (404 si no es del tenant)          |
-| PATCH  | `/tickets/:id`   | tenant  | Actualiza ticket propio                             |
-| DELETE | `/tickets/:id`   | tenant  | Elimina ticket propio                               |
-| POST   | `/chat`          | auth    | Agent loop `{ message, systemPrompt?, conversationId? }` → respuesta del agente + `conversationId` |
-| POST   | `/chat/approve`  | auth    | Reanuda tras pausa de aprobación `{ conversationId, decisions }` → respuesta del agente |
+| GET    | `/health`        | public  | Health check                                        |
+| POST   | `/signup`        | public  | Self-service onboarding `{ companyName, workspaceName, adminEmail, adminPassword, plan? }` |
+| POST   | `/auth/login`    | public  | Login `{ email, password }` → `{ accessToken }`     |
+| GET    | `/auth/me`       | auth    | User + tenant profile (`role`, `plan`, ...)         |
+| POST   | `/tickets`       | tenant  | Create a ticket `{ title }`                         |
+| GET    | `/tickets`       | tenant  | List active tenant tickets (`?status=`)             |
+| GET    | `/tickets/:id`   | tenant  | Read own ticket (404 if not belonging to tenant)    |
+| PATCH  | `/tickets/:id`   | tenant  | Update own ticket                                   |
+| DELETE | `/tickets/:id`   | tenant  | Delete own ticket                                   |
+| POST   | `/chat`          | auth    | Agent loop `{ message, systemPrompt?, conversationId? }` → agent response + `conversationId` |
+| POST   | `/chat/approve`  | auth    | Resume after approval pause `{ conversationId, decisions }` → agent response |
 
-La identidad del tenant sale del JWT (`Authorization: Bearer <token>`), nunca del body. Rutas públicas: `/health`, `/signup`, `/auth/login`.
+Tenant identity comes from the JWT (`Authorization: Bearer <token>`), never from the body. Public routes: `/health`, `/signup`, `/auth/login`.
 
 ## Agent loop
 
-El endpoint `POST /chat` ejecuta un loop agéntico:
+The `POST /chat` endpoint runs an agentic loop:
 
-1. El usuario envía un mensaje.
-2. `AgentService` construye un `LlmRequest` con los tools registrados (Zod → JSON Schema).
-3. Llama a `LlmProvider.complete()`.
-4. Si `stopReason === 'tool_use'`: ejecuta los tools via `ToolRegistry`, appende resultados al historial, repite.
-5. Si `stopReason !== 'tool_use'` o se alcanza `AGENT_MAX_ITERATIONS`: retorna la respuesta.
+1. The user sends a message.
+2. `AgentService` builds an `LlmRequest` with registered tools (Zod → JSON Schema).
+3. Calls `LlmProvider.complete()`.
+4. If `stopReason === 'tool_use'`: executes tools via `ToolRegistry`, appends results to history, repeats.
+5. If `stopReason !== 'tool_use'` or `AGENT_MAX_ITERATIONS` is reached: returns the response.
 
-**Tools disponibles** (registrados por `TicketTools`):
+**Available tools** (registered by `TicketTools`):
 
-| Tool | Descripción | Input |
+| Tool | Description | Input |
 |------|-------------|-------|
-| `create_ticket` | Crea un ticket | `{ title: string }` |
-| `list_tickets` | Lista tickets del tenant | `{ status?: TicketStatus }` |
-| `get_ticket` | Lee un ticket por UUID | `{ ticketId: string }` |
-| `update_ticket` | Actualiza title/status | `{ ticketId, title?, status? }` |
-| `delete_ticket` | Elimina un ticket | `{ ticketId: string }` (requiere aprobación) |
+| `create_ticket` | Creates a ticket | `{ title: string }` |
+| `list_tickets` | Lists tenant tickets | `{ status?: TicketStatus }` |
+| `get_ticket` | Reads a ticket by UUID | `{ ticketId: string }` |
+| `update_ticket` | Updates title/status | `{ ticketId, title?, status? }` |
+| `delete_ticket` | Deletes a ticket | `{ ticketId: string }` (requires approval) |
 
-### Aprobación humana (`requiresApproval`)
+### Human approval (`requiresApproval`)
 
-Las tools destructivas (`delete_ticket`) pausan el loop antes de ejecutarse.
-En la pausa, la respuesta incluye `awaitingApproval.toolCalls[]` con los
-argumentos completos; las llamadas seguras de un batch mixto ya se ejecutaron.
+Destructive tools (`delete_ticket`) pause the loop before executing.
+On pause, the response includes `awaitingApproval.toolCalls[]` with the
+full arguments; safe calls from a mixed batch have already been executed.
 
-La conversación se **persiste en servidor** (`conversationId` devuelto por
-`POST /chat`), por lo que el cliente no tiene que reenviar el historial. Al
-pausar, el estado queda recuperable aunque el cliente se caiga o recargue.
+The conversation is **persisted on the server** (`conversationId` returned by
+`POST /chat`), so the client doesn't have to resend the history. When
+paused, the state is recoverable even if the client crashes or reloads.
 
-El cliente decide con `POST /chat/approve` usando solo el `conversationId` más
-una decisión por call pendiente:
+The client decides via `POST /chat/approve` using only the `conversationId` plus
+one decision per pending call:
 
 ```jsonc
 // POST /chat/approve
 {
-  "conversationId": "uuid-del-conversation",
+  "conversationId": "uuid-of-conversation",
   "decisions": [ { "toolCallId": "call-1", "approved": true } ]
 }
 ```
 
-- Aprobada → se ejecuta una vez y el loop continúa hasta `end_turn`.
-- Rechazada → resultado sintético `REJECTED_BY_USER`; nada se elimina.
-- Calls pendientes no cubiertas por `decisions` → se descartan como
-  `REJECTED_BY_USER` (recuperables) en vez de romper la reanudación.
-- `conversationId` sin pausa pendiente → `400` sin llamar al LLM.
+- Approved → executes once and the loop continues until `end_turn`.
+- Rejected → synthetic `REJECTED_BY_USER` result; nothing is deleted.
+- Pending calls not covered by `decisions` → discarded as
+  `REJECTED_BY_USER` (recoverable) instead of breaking the resumption.
+- `conversationId` with no pending pause → `400` without calling the LLM.
 
-Contrato completo para el FE: `docs/spec-02-agent-approval.md`.
+Full contract for the FE: `docs/spec-02-agent-approval.md`.
 
 ```bash
-AGENT_MAX_ITERATIONS=10      # límite de ciclos del loop
-AGENT_SYSTEM_PROMPT=         # override del system prompt default
+AGENT_MAX_ITERATIONS=10      # loop cycle limit
+AGENT_SYSTEM_PROMPT=         # override default system prompt
 ```
 
 ## LLM provider
 
-El sistema expone un `LlmProvider` intercambiable (DI token `LLM_PROVIDER`):
+The system exposes a swappable `LlmProvider` (DI token `LLM_PROVIDER`):
 
 ```bash
-LLM_PROVIDER=fake                 # default: cassette, sin red — dev/tests
-LLM_PROVIDER=anthropic            # Anthropic real (requiere ANTHROPIC_API_KEY)
-LLM_PROVIDER=groq                 # Groq vía API OpenAI-compatible (requiere GROQ_API_KEY)
+LLM_PROVIDER=fake                 # default: cassette, no network — dev/tests
+LLM_PROVIDER=anthropic            # Real Anthropic (requires ANTHROPIC_API_KEY)
+LLM_PROVIDER=groq                 # Groq via OpenAI-compatible API (requires GROQ_API_KEY)
 
-# Solo para groq:
+# Only for groq:
 GROQ_BASE_URL=https://api.groq.com/openai/v1   # default
-GROQ_MODEL=openai/gpt-oss-120b                 # default; debe soportar tool calling
+GROQ_MODEL=openai/gpt-oss-120b                 # default; must support tool calling
 
-# Smoke test contra el modelo real (NUNCA corre en Jest/CI):
+# Smoke test against the real model (NEVER runs in Jest/CI):
 pnpm run test:groq
-LLM_MODEL=claude-3-5-haiku-latest # modelo por defecto
+LLM_MODEL=claude-3-5-haiku-latest # default model
 ```
 
-Con `fake`, defines respuestas grabadas (cassettes) que se devuelven cuando el request matchea:
+With `fake`, you define recorded responses (cassettes) that are returned when the request matches:
 
 ```ts
 const provider = app.get<FakeLlmProvider>(LLM_PROVIDER);
@@ -189,31 +174,31 @@ provider.add({
 });
 ```
 
-Los tools se declaran una sola vez con Zod (`inputSchema`) y se convierten a JSON Schema para Anthropic con `z.toJSONSchema` — la misma definición valida la entrada y alimenta el function calling.
+Tools are declared once with Zod (`inputSchema`) and converted to JSON Schema for Anthropic via `z.toJSONSchema` — the same definition validates input and feeds function calling.
 
 ## Tests
 
 ```bash
-npm test          # unit (sin BD) — 56 tests
-npm run test:e2e  # e2e sobre la BD de test — 33 tests
+npm test          # unit (no DB) — 56 tests
+npm run test:e2e  # e2e on test DB — 33 tests
 ```
 
-## Arquitectura de aislamiento (cómo funciona)
+## Isolation architecture (how it works)
 
-1. `AuthContextMiddleware` verifica el JWT (`PUBLIC_PATHS`: `/health`, `/signup`, `/auth/login`) y bindea `tenantId` al `AsyncLocalStorage`. En dev, `ALLOW_TENANT_HEADER=true` acepta `x-tenant-id` como fallback.
-2. Todo servicio de dominio de tenant inyecta `TenantScopedPrismaService` (nunca `PrismaService` directo).
-3. La extensión Prisma (`$allModels.$allOperations`) fuerza `tenantId` en `create`/`createMany`/`upsert` y lo mergea último en `where` de lecturas/escrituras — el contexto siempre gana. El modelo `Tenant` es admin y no se scopea.
-4. Operaciones únicas (`findUnique`/`update`/`delete`) con id de otro tenant no matchean → 404 (sin leak de existencia).
-5. En `$transaction` interactivo, el contexto ALS debe envolver el `$transaction` completo (las operaciones internas no ven el store si el `run()` está dentro del callback).
+1. `AuthContextMiddleware` verifies the JWT (`PUBLIC_PATHS`: `/health`, `/signup`, `/auth/login`) and binds `tenantId` to `AsyncLocalStorage`. In dev, `ALLOW_TENANT_HEADER=true` accepts `x-tenant-id` as a fallback.
+2. Every tenant domain service injects `TenantScopedPrismaService` (never `PrismaService` directly).
+3. The Prisma extension (`$allModels.$allOperations`) forces `tenantId` on `create`/`createMany`/`upsert` and merges it last into `where` for reads/writes — the context always wins. The `Tenant` model is admin and not scoped.
+4. Single operations (`findUnique`/`update`/`delete`) with another tenant's id don't match → 404 (no existence leak).
+5. In interactive `$transaction`, the ALS context must wrap the entire `$transaction` (internal operations don't see the store if the `run()` is inside the callback).
 
 ## Roadmap
 
-1. ✅ Base + multi-tenant scaffolding (tests de aislamiento primero)
+1. ✅ Base + multi-tenant scaffolding (isolation tests first)
 2. ✅ LLM provider abstraction + fake provider (cassette, provider-agnostic, Anthropic + fake)
-3. ✅ Signup self-service + auth JWT (SPC-01)
-4. ✅ Tool registry + tools reales (Zod + ticket CRUD tools)
-5. ✅ Agent loop básico (`POST /chat`, loop con maxIterations, tool execution)
+3. ✅ Self-service signup + JWT auth (SPC-01)
+4. ✅ Tool registry + real tools (Zod + ticket CRUD tools)
+5. ✅ Basic agent loop (`POST /chat`, loop with maxIterations, tool execution)
 6. ⬜ Langfuse (traces + spans + prompt management)
 7. ⬜ Model tiering
 8. ⬜ Semantic caching + context management (Redis)
-9. ⬜ Eval suite (fixtures + runner separado)
+9. ⬜ Eval suite (fixtures + separate runner)
