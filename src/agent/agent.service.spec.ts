@@ -5,7 +5,61 @@ import { ToolRegistry } from './tools/tool-registry.service';
 import { FakeLlmProvider } from '../llm/fake-llm.provider';
 import { LLM_PROVIDER } from '../llm/llm.module';
 import type { LlmResponse } from '../llm/llm.types';
+import type { ChatMessage } from '../llm/llm.types';
 import { EventEmitter2 } from '@nestjs/event-emitter';
+import { ConversationService } from './conversation.service';
+import { ConversationStatus } from '../generated/prisma/client';
+
+/**
+ * In-memory stand-in for the real ConversationService so unit tests never touch
+ * a database. Mirrors the persistence semantics (create/find/updateMessages).
+ */
+class FakeConversationService {
+  private store = new Map<
+    string,
+    { messages: ChatMessage[]; status: ConversationStatus }
+  >();
+  private seq = 0;
+
+  async create(messages: ChatMessage[], _opts?: { userId?: string }) {
+    const id = `conv-${++this.seq}`;
+    this.store.set(id, { messages, status: ConversationStatus.ACTIVE });
+    return { id, messages };
+  }
+
+  async find(id: string) {
+    const row = this.store.get(id);
+    if (!row) {
+      const err: any = new Error('Conversation not found');
+      err.status = 404;
+      throw err;
+    }
+    return { id, messages: row.messages, status: row.status };
+  }
+
+  async updateMessages(
+    id: string,
+    messages: ChatMessage[],
+    status?: ConversationStatus,
+  ) {
+    const row = this.store.get(id);
+    if (!row) throw new Error('Conversation not found');
+    row.messages = messages;
+    if (status) row.status = status;
+    return messages;
+  }
+
+  toMessages(value: unknown): ChatMessage[] {
+    return Array.isArray(value) ? (value as ChatMessage[]) : [];
+  }
+
+  /* Test helpers */
+  seed(messages: ChatMessage[]): string {
+    const id = `conv-${++this.seq}`;
+    this.store.set(id, { messages, status: ConversationStatus.PAUSED });
+    return id;
+  }
+}
 
 let callCounter = 0;
 
@@ -39,12 +93,14 @@ describe('AgentService', () => {
   let fakeLlm: FakeLlmProvider;
   let registry: ToolRegistry;
   let eventEmitter: EventEmitter2;
+  let conversations: FakeConversationService;
 
   beforeEach(async () => {
     callCounter = 0;
     fakeLlm = new FakeLlmProvider({ strict: false });
     registry = new ToolRegistry();
     eventEmitter = new EventEmitter2();
+    conversations = new FakeConversationService();
 
     module = await Test.createTestingModule({
       providers: [
@@ -52,6 +108,7 @@ describe('AgentService', () => {
         { provide: LLM_PROVIDER, useValue: fakeLlm },
         { provide: ToolRegistry, useValue: registry },
         { provide: EventEmitter2, useValue: eventEmitter },
+        { provide: ConversationService, useValue: conversations },
       ],
     }).compile();
 
@@ -483,17 +540,8 @@ describe('AgentService', () => {
   describe('approve (resume after approval pause)', () => {
     let executed: boolean;
 
-    function pausedHistory(): {
-      role: 'user' | 'assistant' | 'tool';
-      content: string;
-      toolCalls?: {
-        id: string;
-        name: string;
-        arguments: Record<string, unknown>;
-      }[];
-      toolCallId?: string;
-    }[] {
-      return [
+    function pausedHistory(): string {
+      return conversations.seed([
         { role: 'user', content: 'delete ticket t9' },
         {
           role: 'assistant',
@@ -502,7 +550,7 @@ describe('AgentService', () => {
             { id: 'c2', name: 'delete_ticket', arguments: { ticketId: 't9' } },
           ],
         },
-      ];
+      ]);
     }
 
     function registerDeleteTool(): void {
@@ -527,9 +575,8 @@ describe('AgentService', () => {
 
     it('400 when history has no unanswered assistant toolCalls', async () => {
       registerDeleteTool();
-      await expect(
-        agent.approve([{ role: 'user', content: 'hi' }], []),
-      ).rejects.toThrow(BadRequestException);
+      const id = conversations.seed([{ role: 'user', content: 'hi' }]);
+      await expect(agent.approve(id, [])).rejects.toThrow(BadRequestException);
       expect(executed).toBe(false);
     });
 
@@ -543,9 +590,9 @@ describe('AgentService', () => {
       expect(executed).toBe(false);
     });
 
-    it('400 when decisions do not cover the full pending set', async () => {
+    it('discards pending calls not covered by decisions as REJECTED_BY_USER', async () => {
       registerDeleteTool();
-      const twoPending = [
+      const id = conversations.seed([
         { role: 'user' as const, content: 'clean up' },
         {
           role: 'assistant' as const,
@@ -555,11 +602,28 @@ describe('AgentService', () => {
             { id: 'a2', name: 'delete_ticket', arguments: { ticketId: 't2' } },
           ],
         },
-      ];
-      await expect(
-        agent.approve(twoPending, [{ toolCallId: 'a1', approved: true }]),
-      ).rejects.toThrow(BadRequestException);
-      expect(executed).toBe(false);
+      ]);
+      fakeLlm.addCassettes([
+        {
+          match: { hasToolCalls: true },
+          response: endTurnResponse('Done'),
+        },
+      ]);
+
+      // Only a1 is decided (approved); a2 is orphaned → treated as rejected.
+      const result = await agent.approve(id, [
+        { toolCallId: 'a1', approved: true },
+      ]);
+
+      expect(result.toolResults).toHaveLength(2);
+      const byId = Object.fromEntries(
+        result.toolResults.map((r) => [r.id, r]),
+      );
+      expect(byId['a1'].success).toBe(true);
+      expect(byId['a2']).toMatchObject({
+        success: false,
+        result: { code: 'REJECTED_BY_USER' },
+      });
     });
 
     it('400 when the referenced tool is not registered or lacks requiresApproval', async () => {
@@ -575,7 +639,7 @@ describe('AgentService', () => {
         inputSchema: { safeParse: () => ({ success: true, data: {} }) } as any,
         execute: () => Promise.resolve({ success: true, data: {} }),
       });
-      const createPending = [
+      const createId = conversations.seed([
         { role: 'user', content: 'make one' },
         {
           role: 'assistant' as const,
@@ -584,9 +648,9 @@ describe('AgentService', () => {
             { id: 'k1', name: 'create_ticket', arguments: { title: 'x' } },
           ],
         },
-      ];
+      ]);
       await expect(
-        agent.approve(createPending, [{ toolCallId: 'k1', approved: true }]),
+        agent.approve(createId, [{ toolCallId: 'k1', approved: true }]),
       ).rejects.toThrow(BadRequestException);
     });
 

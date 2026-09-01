@@ -5,6 +5,11 @@ export class ChatDto {
   @IsString()
   message!: string;
 
+  /** Optional: reuse a server-persisted conversation. Omit to start a new one. */
+  @IsOptional()
+  @IsString()
+  conversationId?: string;
+
   @IsOptional()
   @IsArray()
   conversationHistory?: ChatMessage[];

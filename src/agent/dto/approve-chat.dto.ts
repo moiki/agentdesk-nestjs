@@ -55,14 +55,12 @@ export class ApproveDecisionDto {
 }
 
 export class ApproveChatDto {
-  /** Full conversation state as returned by the paused /chat response. */
-  @IsArray()
-  @ArrayNotEmpty()
-  @ValidateNested({ each: true })
-  @Type(() => ChatMessageDto)
-  conversationHistory!: ChatMessageDto[];
+  /** Server-persisted conversation id returned by the paused /chat response. */
+  @IsString()
+  conversationId!: string;
 
-  /** Exactly one decision per pending (awaitingApproval) tool call. */
+  /** One decision per pending (awaitingApproval) tool call. Any pending call
+   *  not covered here is treated as REJECTED_BY_USER (never executed). */
   @IsArray()
   @ArrayNotEmpty()
   @ValidateNested({ each: true })

@@ -44,12 +44,14 @@ describe('Agent approval flow (e2e)', () => {
 
     await prisma.ticket.deleteMany({});
     await prisma.user.deleteMany({});
+    await prisma.conversation.deleteMany({});
     await prisma.tenant.deleteMany({});
   });
 
   afterAll(async () => {
     await prisma.ticket.deleteMany({});
     await prisma.user.deleteMany({});
+    await prisma.conversation.deleteMany({});
     await prisma.tenant.deleteMany({});
     await app.close();
   });
@@ -66,6 +68,7 @@ describe('Agent approval flow (e2e)', () => {
   ): Promise<{
     body: Record<string, any>;
     userMessage: string;
+    conversationId: string;
   }> {
     fakeLlm.add({
       match: { hasToolCalls: false },
@@ -78,29 +81,18 @@ describe('Agent approval flow (e2e)', () => {
       .send({ message: userMessage })
       .expect(201);
 
-    return { body: res.body, userMessage };
-  }
-
-  /** Rebuilds the client-side conversation state from a paused response. */
-  function historyFromPause(
-    userMessage: string,
-    pausedBody: Record<string, any>,
-  ) {
-    return [
-      { role: 'user', content: userMessage },
-      {
-        role: 'assistant',
-        content: '',
-        toolCalls: pausedBody.awaitingApproval.toolCalls,
-      },
-    ];
+    return {
+      body: res.body,
+      userMessage,
+      conversationId: res.body.conversationId as string,
+    };
   }
 
   it('POST /chat/approve requires auth', async () => {
     await request(httpServer)
       .post('/chat/approve')
       .send({
-        conversationHistory: [{ role: 'user', content: 'hi' }],
+        conversationId: 'conv-id',
         decisions: [{ toolCallId: 'call-1', approved: true }],
       })
       .expect(401);
@@ -116,7 +108,7 @@ describe('Agent approval flow (e2e)', () => {
     const ticketId = created.body.id;
 
     // Step 1 — chat pauses exposing the pending destructive call
-    const { body: pausedBody, userMessage } = await pauseOnDelete(
+    const { body: pausedBody, conversationId } = await pauseOnDelete(
       tenant.accessToken,
       ticketId,
     );
@@ -141,7 +133,7 @@ describe('Agent approval flow (e2e)', () => {
       .post('/chat/approve')
       .set(asUser(tenant.accessToken))
       .send({
-        conversationHistory: historyFromPause(userMessage, pausedBody),
+        conversationId,
         decisions: [
           {
             toolCallId: pausedBody.awaitingApproval.toolCalls[0].id,
@@ -172,7 +164,7 @@ describe('Agent approval flow (e2e)', () => {
       .expect(201);
     const ticketId = created.body.id;
 
-    const { body: pausedBody, userMessage } = await pauseOnDelete(
+    const { body: pausedBody, conversationId } = await pauseOnDelete(
       tenant.accessToken,
       ticketId,
     );
@@ -185,7 +177,7 @@ describe('Agent approval flow (e2e)', () => {
       .post('/chat/approve')
       .set(asUser(tenant.accessToken))
       .send({
-        conversationHistory: historyFromPause(userMessage, pausedBody),
+        conversationId,
         decisions: [
           {
             toolCallId: pausedBody.awaitingApproval.toolCalls[0].id,
@@ -212,9 +204,22 @@ describe('Agent approval flow (e2e)', () => {
     ).not.toBeNull();
   });
 
-  it('400 on forged state without calling the LLM', async () => {
+  it('400 on a conversation with no pending approval (without calling the LLM)', async () => {
     const tenant = await signupAndAuth(httpServer);
 
+    // Create a normal, completed conversation with no pending tool calls.
+    fakeLlm.add({
+      match: { hasToolCalls: false },
+      response: endTurn('no approvals here'),
+    });
+    const chatRes = await request(httpServer)
+      .post('/chat')
+      .set(asUser(tenant.accessToken))
+      .send({ message: 'just chatting' })
+      .expect(201);
+    const conversationId = chatRes.body.conversationId;
+
+    fakeLlm.clear();
     fakeLlm.add({
       match: {},
       response: endTurn('should never be returned'),
@@ -223,9 +228,7 @@ describe('Agent approval flow (e2e)', () => {
       .post('/chat/approve')
       .set(asUser(tenant.accessToken))
       .send({
-        conversationHistory: [
-          { role: 'user', content: 'nothing pending here' },
-        ],
+        conversationId,
         decisions: [{ toolCallId: 'made-up-id', approved: true }],
       })
       .expect(400);
@@ -240,7 +243,7 @@ describe('Agent approval flow (e2e)', () => {
       .post('/chat/approve')
       .set(asUser(tenant.accessToken))
       .send({
-        conversationHistory: [{ role: 'user', content: 'hi' }],
+        conversationId: 'conv-id',
         decisions: [{ toolCallId: 'call-1' }], // missing `approved`
       })
       .expect(400);
@@ -249,7 +252,7 @@ describe('Agent approval flow (e2e)', () => {
       .post('/chat/approve')
       .set(asUser(tenant.accessToken))
       .send({
-        conversationHistory: [{ role: 'user', content: 'hi' }],
+        conversationId: 'conv-id',
         decisions: [{ toolCallId: 'call-1', approved: true }],
         sneakyExtraField: true, // forbidNonWhitelisted
       })
@@ -267,7 +270,7 @@ describe('Agent approval flow (e2e)', () => {
         .expect(201);
       const bTicketId = createdB.body.id;
 
-      const { body: pausedBody, userMessage } = await pauseOnDelete(
+      const { body: pausedBody, conversationId } = await pauseOnDelete(
         tenantA.accessToken,
         bTicketId,
       );
@@ -280,7 +283,7 @@ describe('Agent approval flow (e2e)', () => {
         .post('/chat/approve')
         .set(asUser(tenantA.accessToken))
         .send({
-          conversationHistory: historyFromPause(userMessage, pausedBody),
+          conversationId,
           decisions: [
             {
               toolCallId: pausedBody.awaitingApproval.toolCalls[0].id,
@@ -317,7 +320,7 @@ describe('Agent approval flow (e2e)', () => {
     const secondId = second.body.id;
 
     // Pause #1 on the first ticket
-    const { body: pausedBody, userMessage } = await pauseOnDelete(
+    const { body: pausedBody, conversationId } = await pauseOnDelete(
       tenant.accessToken,
       firstId,
     );
@@ -331,7 +334,7 @@ describe('Agent approval flow (e2e)', () => {
       .post('/chat/approve')
       .set(asUser(tenant.accessToken))
       .send({
-        conversationHistory: historyFromPause(userMessage, pausedBody),
+        conversationId,
         decisions: [
           {
             toolCallId: pausedBody.awaitingApproval.toolCalls[0].id,
@@ -360,32 +363,17 @@ describe('Agent approval flow (e2e)', () => {
       await prisma.ticket.findUnique({ where: { id: secondId } }),
     ).not.toBeNull();
 
-    // Second decision also works from the re-paused state
+    // Second decision resumes the SAME persisted conversation from the re-pause
     fakeLlm.clear();
     fakeLlm.add({
       match: { hasToolCalls: true },
       response: endTurn('Both deleted.'),
     });
-    const history2 = [
-      ...historyFromPause(userMessage, pausedBody),
-      {
-        role: 'tool',
-        content: JSON.stringify(
-          resumeRes.body.toolResults[0].result ?? { deleted: true },
-        ),
-        toolCallId: pausedBody.awaitingApproval.toolCalls[0].id,
-      },
-      {
-        role: 'assistant',
-        content: '',
-        toolCalls: resumeRes.body.awaitingApproval.toolCalls,
-      },
-    ];
     const finalRes = await request(httpServer)
       .post('/chat/approve')
       .set(asUser(tenant.accessToken))
       .send({
-        conversationHistory: history2,
+        conversationId,
         decisions: [
           {
             toolCallId: resumeRes.body.awaitingApproval.toolCalls[0].id,
@@ -410,31 +398,33 @@ describe('Agent approval flow (e2e)', () => {
       .expect(201);
     const ticketId = created.body.id;
 
+    // The model (fake) requests delete_ticket with a malformed ticketId.
+    fakeLlm.add({
+      match: { hasToolCalls: false },
+      response: toolUse('delete_ticket', { ticketId: 'not-a-uuid' }),
+    });
+    const pause = await request(httpServer)
+      .post('/chat')
+      .set(asUser(tenant.accessToken))
+      .send({ message: `delete the ticket ${ticketId}` })
+      .expect(201);
+    const conversationId = pause.body.conversationId;
+    const badCallId = pause.body.awaitingApproval.toolCalls[0].id;
+    expect(pause.body.awaitingApproval.toolCalls[0].arguments.ticketId).toBe(
+      'not-a-uuid',
+    );
+
+    fakeLlm.clear();
     fakeLlm.add({
       match: { hasToolCalls: true },
       response: endTurn('Could not delete that ticket.'),
     });
 
-    // Forged-but-plausible pause whose arguments violate z.string().uuid()
-    const badCallId = 'call-bad-args';
     const res = await request(httpServer)
       .post('/chat/approve')
       .set(asUser(tenant.accessToken))
       .send({
-        conversationHistory: [
-          { role: 'user', content: 'delete it' },
-          {
-            role: 'assistant',
-            content: '',
-            toolCalls: [
-              {
-                id: badCallId,
-                name: 'delete_ticket',
-                arguments: { ticketId: 'not-a-uuid' },
-              },
-            ],
-          },
-        ],
+        conversationId,
         decisions: [{ toolCallId: badCallId, approved: true }],
       })
       .expect(201);

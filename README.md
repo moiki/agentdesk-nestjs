@@ -36,6 +36,58 @@ npm run start:dev        # API en http://localhost:3000
 
 El puerto de Postgres es `5433` (no `5432`) porque asume que puede haber un Postgres local en 5432.
 
+## Levantar todo con Docker
+
+El `docker-compose.yml` levanta el stack **completo** (incluida la app NestJS en modo producción) sin necesidad de Node.js local:
+
+```bash
+# 1) Arranca Postgres + Redis + la app (imagen de producción en http://localhost:3000)
+docker compose up -d
+
+# 2) Aplica las migraciones de Prisma (one-off, se detiene al terminar)
+docker compose --profile tools run --rm migrate
+
+# Ver logs de la app
+docker compose logs -f app
+```
+
+Para **actualizar** tras cambiar código o env vars:
+
+```bash
+docker compose up -d --build        # reconstruye la imagen de la app
+```
+
+Para **detener**:
+
+```bash
+docker compose down                 # detiene los contenedores
+docker compose down -v              # + elimina los volúmenes (borra la BD y Redis)
+```
+
+### Servicios
+
+| Servicio | Imagen | Puerto externo | Notas |
+|---|---|---|---|
+| `app` | build local (NestJS, multi-stage) | `3000` | Arranca tras el healthcheck de Postgres y Redis |
+| `postgres` | `postgres:16-alpine` | `5433` | Volumen persistente `agentdesk-pgdata` |
+| `redis` | `redis:7-alpine` | `6379` | Volumen persistente `agentdesk-redisdata` |
+| `migrate` | build local | — | One-off (`profile: tools`), solo aplica migraciones y sale |
+
+### Configuración via `.env`
+
+Todas las variables del compose se alimentan del archivo `.env` (crea uno a partir de `.env.example`). Las más relevantes:
+
+| Variable | Default | Descripción |
+|---|---|---|
+| `PORT` | `3000` | Puerto de la app |
+| `CORS_ORIGINS` | `*` | Orígenes permitidos (comma-separated). Para dev con FE en localhost:5173 → `http://localhost:5173` |
+| `LLM_PROVIDER` | `fake` | `fake` / `anthropic` / `groq` |
+| `GROQ_API_KEY` | — | Requerida si `LLM_PROVIDER=groq` |
+| `ANTHROPIC_API_KEY` | — | Requerida si `LLM_PROVIDER=anthropic` |
+| `DATABASE_URL` | apunta a `postgres` interno | Compuesta automáticamente desde `POSTGRES_*` |
+
+> Nota: la app espera a que Postgres y Redis pasen su healthcheck antes de arrancar (`depends_on: condition: service_healthy`). Si la app crashea al inicio, revisa `docker compose logs app`.
+
 ## API
 
 | Método | Ruta             | Scope   | Descripción                                         |
@@ -49,8 +101,8 @@ El puerto de Postgres es `5433` (no `5432`) porque asume que puede haber un Post
 | GET    | `/tickets/:id`   | tenant  | Lee ticket propio (404 si no es del tenant)          |
 | PATCH  | `/tickets/:id`   | tenant  | Actualiza ticket propio                             |
 | DELETE | `/tickets/:id`   | tenant  | Elimina ticket propio                               |
-| POST   | `/chat`          | auth    | Agent loop `{ message, conversationHistory?, systemPrompt? }` → respuesta del agente |
-| POST   | `/chat/approve`  | auth    | Reanuda tras pausa de aprobación `{ conversationHistory, decisions }` → respuesta del agente |
+| POST   | `/chat`          | auth    | Agent loop `{ message, systemPrompt?, conversationId? }` → respuesta del agente + `conversationId` |
+| POST   | `/chat/approve`  | auth    | Reanuda tras pausa de aprobación `{ conversationId, decisions }` → respuesta del agente |
 
 La identidad del tenant sale del JWT (`Authorization: Bearer <token>`), nunca del body. Rutas públicas: `/health`, `/signup`, `/auth/login`.
 
@@ -80,20 +132,26 @@ Las tools destructivas (`delete_ticket`) pausan el loop antes de ejecutarse.
 En la pausa, la respuesta incluye `awaitingApproval.toolCalls[]` con los
 argumentos completos; las llamadas seguras de un batch mixto ya se ejecutaron.
 
-El cliente decide con `POST /chat/approve` reenviando el historial que conserva
-más una decisión por call pendiente:
+La conversación se **persiste en servidor** (`conversationId` devuelto por
+`POST /chat`), por lo que el cliente no tiene que reenviar el historial. Al
+pausar, el estado queda recuperable aunque el cliente se caiga o recargue.
+
+El cliente decide con `POST /chat/approve` usando solo el `conversationId` más
+una decisión por call pendiente:
 
 ```jsonc
 // POST /chat/approve
 {
-  "conversationHistory": [ /* estado devuelto por la pausa */ ],
+  "conversationId": "uuid-del-conversation",
   "decisions": [ { "toolCallId": "call-1", "approved": true } ]
 }
 ```
 
 - Aprobada → se ejecuta una vez y el loop continúa hasta `end_turn`.
 - Rechazada → resultado sintético `REJECTED_BY_USER`; nada se elimina.
-- Estado inválido o falsificado → `400` sin llamar al LLM.
+- Calls pendientes no cubiertas por `decisions` → se descartan como
+  `REJECTED_BY_USER` (recuperables) en vez de romper la reanudación.
+- `conversationId` sin pausa pendiente → `400` sin llamar al LLM.
 
 Contrato completo para el FE: `docs/spec-02-agent-approval.md`.
 

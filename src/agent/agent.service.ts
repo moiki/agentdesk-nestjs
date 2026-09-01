@@ -11,6 +11,9 @@ import type {
   LlmUsage,
 } from '../llm/llm.types';
 import { ToolRegistry } from './tools/tool-registry.service';
+import { ConversationService } from './conversation.service';
+import { ConversationStatus } from '../generated/prisma/client';
+import { getTenantContext } from '../tenancy/tenant-context';
 
 export interface ToolCallResult {
   id: string;
@@ -20,6 +23,8 @@ export interface ToolCallResult {
 }
 
 export interface ChatResponse {
+  /** Server-side conversation handle. Every /chat and /chat/approve returns it. */
+  conversationId: string;
   message: string;
   toolCalls: { id: string; name: string; arguments: Record<string, unknown> }[];
   toolResults: ToolCallResult[];
@@ -56,6 +61,10 @@ When a tool returns an error, analyze the error code:
 - VALIDATION_ERROR: fix the input and retry
 - INTERNAL_ERROR: do NOT retry, tell the user something went wrong on our end`;
 
+function getUserId(): string | undefined {
+  return getTenantContext()?.userId;
+}
+
 @Injectable()
 export class AgentService {
   private readonly logger = new Logger(AgentService.name);
@@ -67,6 +76,7 @@ export class AgentService {
     @Inject(LLM_PROVIDER) private readonly llm: LlmProvider,
     private readonly registry: ToolRegistry,
     private readonly eventEmitter: EventEmitter2,
+    private readonly conversations: ConversationService,
   ) {
     this.budget = {
       maxIterations: ENV.AGENT_MAX_ITERATIONS,
@@ -77,13 +87,30 @@ export class AgentService {
     this.maxRetries = ENV.AGENT_LLM_MAX_RETRIES;
   }
 
+  /**
+   * Runs the agent for a user message. The conversation is persisted
+   * server-side: pass a `conversationId` to continue an existing thread, or
+   * omit it to start a new one. The harness owns the message history, so the
+   * persisted state is always consistent (no orphaned tool calls), even if the
+   * client disconnects mid-turn.
+   */
   async chat(
     userMessage: string,
     conversationHistory?: ChatMessage[],
     systemPrompt?: string,
+    conversationId?: string,
   ): Promise<ChatResponse> {
+    const existing = conversationId
+      ? await this.loadConversation(conversationId)
+      : await this.conversations.create(conversationHistory ?? [], {
+          userId: getUserId(),
+        });
+
+    const conversationID = existing.id;
     const messages: ChatMessage[] = [
-      ...(conversationHistory ?? []),
+      ...(conversationHistory && !conversationId
+        ? conversationHistory
+        : existing.messages ?? []),
       { role: 'user', content: userMessage },
     ];
 
@@ -92,21 +119,29 @@ export class AgentService {
       toolResults: [],
       usage: { inputTokens: 0, outputTokens: 0 },
       iterations: 0,
-    });
+    }, conversationID, (next, status) =>
+      this.conversations.updateMessages(conversationID, next, status),
+    );
   }
 
   /**
-   * Resumes a paused run after a human decision. Stateless by design: the
-   * client sends back the history it received plus one decision per pending
-   * tool call. Approved tools execute here (registry re-validates args);
-   * rejected ones get a synthetic REJECTED_BY_USER result so every tool_use
-   * stays paired with a tool_result in the provider-visible history.
+   * Resumes a paused run after a human decision.
+   *
+   * The conversation state is loaded from the server (source of truth), so the
+   * history can never be forged or corrupted by a crashed client. Pending =
+   * the awaitingApproval tool calls persisted on the paused turn. Decisions
+   * are applied per call; any pending call NOT covered by a decision (e.g.
+   * orphaned by an interrupted session) is treated as REJECTED_BY_USER —
+   * it is never executed, but the loop still recovers instead of 400ing.
    */
   async approve(
-    conversationHistory: ChatMessage[],
+    conversationId: string,
     decisions: { toolCallId: string; approved: boolean }[],
   ): Promise<ChatResponse> {
-    const messages: ChatMessage[] = conversationHistory.map((m) => ({ ...m }));
+    const existing = await this.loadConversation(conversationId);
+    const messages: ChatMessage[] = (existing.messages ?? []).map((m) => ({
+      ...m,
+    }));
 
     // Pending = assistant toolCalls without an answering role:'tool' message.
     const answeredIds = new Set(
@@ -119,12 +154,11 @@ export class AgentService {
 
     if (pending.length === 0) {
       throw new BadRequestException(
-        'No pending approval tool calls found in conversation history.',
+        'No pending approval tool calls found for this conversation.',
       );
     }
 
-    // Decisions must cover the pending set exactly — no missing, extra or
-    // duplicated entries. This is what prevents forged or partial resumes.
+    // Decisions must not be duplicated and may only reference the pending set.
     const decisionById = new Map<string, boolean>();
     for (const decision of decisions) {
       if (decisionById.has(decision.toolCallId)) {
@@ -132,17 +166,12 @@ export class AgentService {
           `Duplicate decision for toolCallId "${decision.toolCallId}".`,
         );
       }
+      if (!pending.some((tc) => tc.id === decision.toolCallId)) {
+        throw new BadRequestException(
+          `Unknown toolCallId "${decision.toolCallId}".`,
+        );
+      }
       decisionById.set(decision.toolCallId, decision.approved);
-    }
-    for (const tc of pending) {
-      if (!decisionById.has(tc.id)) {
-        throw new BadRequestException(`Missing decision for "${tc.id}".`);
-      }
-    }
-    for (const id of decisionById.keys()) {
-      if (!pending.some((tc) => tc.id === id)) {
-        throw new BadRequestException(`Unknown toolCallId "${id}".`);
-      }
     }
 
     // Only tools explicitly flagged requiresApproval are decidable here.
@@ -163,9 +192,20 @@ export class AgentService {
       iterations: 1,
     };
 
-    for (const tc of pending) {
+    // Orphaned pending calls (no decision) are discarded as rejected: they are
+    // never executed, but the conversation recovers instead of being stuck.
+    const allDecided = new Set(decisionById.keys());
+    const effective: { tc: LlmToolCall; approved: boolean }[] = pending.map(
+      (tc) => ({
+        tc,
+        approved: allDecided.has(tc.id)
+          ? decisionById.get(tc.id) === true
+          : false,
+      }),
+    );
+
+    for (const { tc, approved } of effective) {
       acc.toolCalls.push(tc);
-      const approved = decisionById.get(tc.id) === true;
 
       const result = approved
         ? await this.registry.execute(tc.name, tc.arguments)
@@ -196,17 +236,43 @@ export class AgentService {
       });
     }
 
-    return this.runLoop(messages, this.defaultSystemPrompt, acc);
+    return this.runLoop(
+      messages,
+      this.defaultSystemPrompt,
+      acc,
+      conversationId,
+      (next, status) =>
+        this.conversations.updateMessages(conversationId, next, status),
+    );
+  }
+
+  /**
+   * Loads a conversation owned by the active tenant and returns its persisted
+   * message history. Cross-tenant or missing ids fail closed (404).
+   */
+  private async loadConversation(conversationId: string) {
+    const conversation = await this.conversations.find(conversationId);
+    return {
+      id: conversation.id,
+      messages: this.conversations.toMessages(conversation.messages),
+    };
   }
 
   /**
    * Core agentic loop. Shared by `chat()` (fresh run) and the approval-resume
-   * flow (seeded accumulators + pre-built message history).
+   * flow (seeded accumulators + pre-built message history). Persists the
+   * message history via `persist` at every terminal point (pause or finish),
+   * so a client disconnect never leaves the server with stale/orphaned state.
    */
   private async runLoop(
     messages: ChatMessage[],
     system: string,
     acc: LoopAccumulators,
+    conversationId: string,
+    persist: (
+      messages: ChatMessage[],
+      status?: ConversationStatus,
+    ) => Promise<unknown>,
   ): Promise<ChatResponse> {
     const tools = this.registry.getDefinitions();
     const startTime = Date.now();
@@ -220,14 +286,16 @@ export class AgentService {
       );
       if (budgetCheck) {
         this.logger.warn(`Budget exceeded: ${budgetCheck}`);
-        return {
+        const response = {
           message: `I stopped early: ${budgetCheck}. Please try a simpler request.`,
           toolCalls: acc.toolCalls,
           toolResults: acc.toolResults,
           usage: acc.usage,
-          stopReason: 'max_iterations',
+          stopReason: 'max_iterations' as const,
           iterations: acc.iterations,
         };
+        await persist(messages, ConversationStatus.COMPLETED);
+        return { conversationId, ...response };
       }
 
       acc.iterations++;
@@ -254,7 +322,9 @@ export class AgentService {
         response.stopReason !== 'tool_use' ||
         response.toolCalls.length === 0
       ) {
+        await persist(messages, ConversationStatus.COMPLETED);
         return {
+          conversationId,
           message: response.content,
           toolCalls: acc.toolCalls,
           toolResults: acc.toolResults,
@@ -318,7 +388,11 @@ export class AgentService {
           toolCalls: needsApproval,
           iteration: acc.iterations,
         });
+        // Persist the pending state so /chat/approve can recover it even if
+        // the client disconnected after the pause.
+        await persist(messages, ConversationStatus.PAUSED);
         return {
+          conversationId,
           message:
             'I need your approval before proceeding with the following actions.',
           toolCalls: [...acc.toolCalls, ...needsApproval],
@@ -335,7 +409,9 @@ export class AgentService {
       `Agent loop hit max iterations (${this.budget.maxIterations}) — forcing stop`,
     );
 
+    await persist(messages, ConversationStatus.COMPLETED);
     return {
+      conversationId,
       message:
         'I reached the maximum number of actions for this request. Please try again with a simpler request.',
       toolCalls: acc.toolCalls,

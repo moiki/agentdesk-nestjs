@@ -19,8 +19,8 @@ Contexto de trabajo para retomar la sesión sin perder nada. Se actualiza al cie
 - ✅ **Docker formal** — Dockerfile multi-stage (deps→build→production), .dockerignore, docker-compose.yml con app + migrate profile, health check con DB connectivity.
 - ✅ **SPC-02 Approval flow** (`openspec/specs/agent-approval/`) — pausa explícita `awaitingApproval`, endpoint `POST /chat/approve` con validación anti-falsificación, rechazo sintético `REJECTED_BY_USER`, partición 3-vía (read-only paralelo / mutantes secuenciales / needsApproval pausa). Docs FE en `docs/spec-02-agent-approval.md`.
 - ✅ **Groq provider** (`openspec/specs/groq-provider/`) — `OpenAICompatibleProvider` genérico (chat-completions compatibles), `LLM_PROVIDER=groq`, smoke real `pnpm run test:groq` (pausa→approve→delete contra API Groq). Default `openai/gpt-oss-120b`.
-- Verificación verde: build ✓ lint ✓ **92 unit** ✓ **41 e2e** ✓ `prisma migrate status` ✓.
-- Ambos cambios archivados en `openspec/changes/archive/2026-08-21-*`.
+- ✅ **SPC-03 Persistencia server-side de conversaciones** (Opción 3 del plan de acción) — `POST /chat` devuelve `conversationId`; el historial ya NO vive en el cliente. `POST /chat/approve` ahora recibe `{ conversationId, decisions }` (sin `conversationHistory`) y carga el estado canónico desde DB vía `ConversationService`. Modelo Prisma `Conversation` + enum `ConversationStatus` (`ACTIVE|PAUSED|COMPLETED`), migración `20260831225230_add_conversation`. Fix raíz: el `400 Missing decision` por toolCalls huérfanas tras crash del cliente se resuelve con **discard como `REJECTED_BY_USER`** (calls no cubiertas por decisions se tratan como rechazadas/recoverables, no rompen la reanudación). Persistencia tenant-scoped (usa `findFirst` por `id`, no `findUnique`, para evitar el compound-unique de scoping).
+- Verificación verde: build ✓ lint ✓ **92 unit** ✓ **41 e2e** ✓ `prisma migrate status` ✓ (migración añadida y aplicada a dev 5433 + test agentdesk_test via global-setup).
 
 ## Próximo bloque (roadmap)
 
@@ -28,7 +28,7 @@ Contexto de trabajo para retomar la sesión sin perder nada. Se actualiza al cie
 2. Decisión abierta: **streaming** del agent loop (SSE o WebSocket).
 3. **Model tiering** — routing por complejidad/costo.
 4. **Semantic caching** — Redis para respuestas frecuentes.
-5. Infra pendiente: `docker compose up` completo falla construyendo servicio `app` (`pnpm-lock.yaml` no llega al build — revisar `.dockerignore`). Postgres/Redis individuales OK.
+5. Infra pendiente: ~~`docker compose up` falla en `app` (`pnpm-lock.yaml` no llega al build)~~ **resuelto** — `docker compose build app` + `up -d` OK (healthy). Pendiente aún: `migrate` profile usa la imagen y `.dockerignore` excluye `prisma/migrations/`, así que `migrate deploy` en contenedor no ve migraciones; la migración `add_conversation` se aplicó vía host (`prisma migrate deploy` a 5433).
 
 ## Decisiones y gotchas (no volver a pisarlas)
 
@@ -61,8 +61,9 @@ Contexto de trabajo para retomar la sesión sin perder nada. Se actualiza al cie
 | 25 | ts-node CJS no resuelve los imports `.js` del cliente Prisma generado (solo jest lo mapea) | Otra razón para compilar scripts standalone a dist (gotcha 22) |
 | 26 | Validación anti-falsificación del approve: pending ≠ "último mensaje assistant" | Detección = toolCalls SIN responder (ids sin mensaje `role:'tool'` correspondiente); necesario para batches mixtos donde resultados seguros siguen al assistant |
 | 27 | `coverage/` estaba trackeada en git — ensuciaba cada diff | Des-indexada + `.gitignore`; si reaparece en diff, es working tree local |
+| 28 | Scoping tenant autorizaría un `findUnique` compound-unique en `Conversation` y romper el lookup por id | `Conversation` usa `@id` plano y `findFirst({ where: { id } })` — la extensión inyecta `tenantId`, lo que da lookups enfocados al tenant (fails closed cross-tenant) |
 
-Decisiones de arquitectura: la identidad del tenant sale **solo del JWT**; el modelo `Tenant` es admin (exento de scoping); `TenantScopedPrismaService` es el único camino para dominio de tenant; auth = middleware único como enforcement point (no guard, por orden middleware→guards en NestJS); signup usa transacción + `tenantContextStore.run` envolviendo el `$transaction`. El agent loop es **stateless** (el cliente maneja el historial). `ToolRegistry` es central y extensible (registrar nuevos tools = implementar `Tool` y `register()`). Los tools se declaran con `mutating: true/false` para paralelismo y `requiresApproval: true/false` para aprobación humana. `EventEmitter2` emite eventos por iteración para Langfuse futuro.
+Decisiones de arquitectura: la identidad del tenant sale **solo del JWT**; el modelo `Tenant` es admin (exento de scoping); `TenantScopedPrismaService` es el único camino para dominio de tenant; auth = middleware único como enforcement point (no guard, por orden middleware→guards en NestJS); signup usa transacción + `tenantContextStore.run` envolviendo el `$transaction`. El agent loop es **stateful server-side**: `AgentService.chat()` persiste la conversación (`ConversationService`) y `approve()` carga el estado canónico desde DB; el cliente solo guarda y reenvía el `conversationId`. `ToolRegistry` es central y extensible (registrar nuevos tools = implementar `Tool` y `register()`). Los tools se declaran con `mutating: true/false` para paralelismo y `requiresApproval: true/false` para aprobación humana. `EventEmitter2` emite eventos por iteración para Langfuse futuro.
 
 ## Modelos y ambiente
 
@@ -71,7 +72,7 @@ Decisiones de arquitectura: la identidad del tenant sale **solo del JWT**; el mo
 - `test/setup-env.ts` fuerza `LLM_PROVIDER=fake`, `JWT_SECRET=test-secret`, throttle alto y `DATABASE_URL`→test.
 - e2e: `node --experimental-vm-modules` + config `test/jest-e2e.json` (moduleNameMapper, `maxWorkers: 1`).
 - GitHub Models está **retirado** (jul-2026); para probar flujos de agente: fake cassettes (primario), Groq real (`pnpm run test:groq`, requiere `GROQ_API_KEY`) o Anthropic real.
-- Guía para consumidores del backend (FE): **`docs/integration-guide.md`** — contrato completo de endpoints, chat stateless y approval flow.
+- Guía para consumidores del backend (FE): **`docs/integration-guide.md`** — contrato completo de endpoints, chat con persistencia server-side (`conversationId`) y approval flow.
 
 ## Comandos de verificación
 
@@ -86,7 +87,7 @@ npx prisma migrate status   # valida prisma.config.ts tras cambios de env
 
 ## Archivos relevantes
 
-- `src/agent/` — `agent.module.ts` (EventEmitterModule + LlmModule + TicketsModule + TenancyModule), `agent.service.ts` (orchestrator loop con retry, budget compuesto, paralelización, `runLoop()`, approval flow + `approve()`), `chat.controller.ts` (`POST /chat`, `POST /chat/approve`), `dto/chat.dto.ts`, `dto/approve-chat.dto.ts`.
+- `src/agent/` — `agent.module.ts` (EventEmitterModule + LlmModule + TicketsModule + TenancyModule), `agent.service.ts` (orchestrator loop con retry, budget compuesto, paralelización, `runLoop()`, approval flow + `approve()`), `conversation.service.ts` (persistencia server-side tenant-scoped: `create`/`updateMessages`/`setStatus`/`toMessages`), `chat.controller.ts` (`POST /chat`, `POST /chat/approve`), `dto/chat.dto.ts` (añade `conversationId`), `dto/approve-chat.dto.ts` (ahora `{ conversationId, decisions }`, `conversationHistory` eliminado).
 - `src/agent/tools/` — `tool.interface.ts` (Tool + ToolResult + ToolErrorCode con `REJECTED_BY_USER`), `tool-registry.service.ts` (register, getDefinitions, getTool, execute con truncado y safeParse), `ticket-tools.ts` (5 tools CRUD, mutating + requiresApproval flags).
 - `src/health/health.controller.ts` — `GET /health` con check de DB connectivity (usado por Docker healthcheck).
 - `src/llm/` — `llm-provider.interface.ts`, `llm.types.ts` (LlmStopReason incluye `max_iterations`), `tool-schema.ts`, `fake-llm.provider.ts` (cassettes + `clear()`), `anthropic-llm.provider.ts`, `openai-compatible.provider.ts` (Groq/OpenAI/compatibles; modelo del provider autoritativo), `llm.module.ts` (`createLlmProvider()` exportada: fake | anthropic | groq).

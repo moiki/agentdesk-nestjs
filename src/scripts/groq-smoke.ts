@@ -56,19 +56,11 @@ async function main(): Promise<number> {
         throw new Error('Ticket was deleted BEFORE approval!');
       }
 
-      // Phase 2 — human approves → tool runs once → end_turn
+      // Phase 2 — human approves → tool runs once → end_turn. The harness
+      // resumes the persisted conversation (conversationId), so no client
+      // state needs to be replayed.
       const final = await agent.approve(
-        [
-          {
-            role: 'user',
-            content: `Delete the ticket with id "${ticket.id}" using the delete_ticket tool. Do not ask questions.`,
-          },
-          {
-            role: 'assistant',
-            content: paused.message,
-            toolCalls: paused.awaitingApproval.toolCalls,
-          },
-        ],
+        paused.conversationId,
         [
           {
             toolCallId: paused.awaitingApproval.toolCalls[0].id,

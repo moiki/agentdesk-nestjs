@@ -72,18 +72,24 @@ Reglas:
 | `PATCH /tickets/:id` | auth | `{ title?, status? }` |
 | `DELETE /tickets/:id` | auth | Borra directo (sin aprobación vía REST; la aprobación aplica solo al agente) |
 
-## 5. Chat stateless (`POST /chat`)
+## 5. Chat con persistencia server-side (`POST /chat`)
 
-El backend **no guarda conversación**: tú conservas el historial y lo reenvías.
+El backend **guarda la conversación** y te devuelve un `conversationId`. No
+tienes que llevar el historial contigo: envías el `conversationId` para
+continuar. Esto permite recuperar el contexto incluso si el cliente se cae o
+recarga.
 
 ```jsonc
-// Request
+// Request (primer mensaje — sin conversationId)
 {
   "message": "¿Qué tickets hay abiertos?",
-  "conversationHistory": [          // opcional — estado que TÚ persistes
-    { "role": "user", "content": "hola" },
-    { "role": "assistant", "content": "¡Hola! ¿en qué te ayudo?" }
-  ],
+  "systemPrompt": "Eres soporte de Acme..."   // opcional
+}
+
+// Request (continuar — con conversationId de la respuesta anterior)
+{
+  "message": "Ahora elimina el de la fila de arriba",
+  "conversationId": "uuid-de-la-conversacion",
   "systemPrompt": "Eres soporte de Acme..."   // opcional
 }
 ```
@@ -91,6 +97,7 @@ El backend **no guarda conversación**: tú conservas el historial y lo reenvía
 ```jsonc
 // Response — ChatResponse
 {
+  "conversationId": "uuid-de-la-conversacion",   // guarda este id
   "message": "Hay 2 tickets abiertos...",
   "toolCalls":   [ { "id":"call_1", "name":"list_tickets", "arguments":{"status":"OPEN"} } ],
   "toolResults": [ { "id":"call_1", "name":"list_tickets", "success": true,
@@ -114,7 +121,7 @@ Interpretación del `stopReason`:
 
 Notas:
 - `toolCalls`/`toolResults` vienen **siempre** (arrays vacíos si no hubo tools) — acumulados de toda la conversación del turno.
-- Para continuar una conversación, appendea `{user}` y `{assistant}` al historial que ya tienes.
+- **Guarda el `conversationId`** de la respuesta y reenviáselo al backend en el siguiente `message` para continuar el hilo.
 
 ### Herramientas disponibles hoy
 
@@ -144,7 +151,7 @@ Máquina de estados desde el punto de vista del FE:
                     usuario decide (approve/reject por cada call)
                            │
                     POST /chat/approve
-             { conversationHistory, decisions }
+             { conversationId, decisions }
                            │
               ┌── nueva pausa (awaitingApproval) ── repetir
               └── end_turn ──► mostrar message
@@ -153,38 +160,38 @@ Máquina de estados desde el punto de vista del FE:
 ### Detección de pausa
 - `awaitingApproval.toolCalls[]` trae `{ id, name, arguments }` **completos** → pinta confirmación (ej: “¿Eliminar ticket X?”).
 - Si el turno pedía varias cosas, las herramientas seguras **ya se ejecutaron** antes de pausar: revisa también `toolResults`.
+- La pausa queda **persistida en servidor**: aunque pierdas el estado del cliente, el `conversationId` sigue apuntando a la pausa pendiente.
 
 ### Decisión (`POST /chat/approve`, auth)
 
 ```jsonc
 {
-  // El MISMO historial que conservas — debe terminar en el turno assistant
-  // con las toolCalls pendientes SIN respuesta (tal como llegó la pausa):
-  "conversationHistory": [
-    { "role": "user", "content": "Elimina el ticket X" },
-    { "role": "assistant", "content": "", "toolCalls": [ {"id":"call_1","name":"delete_ticket","arguments":{"ticketId":"..."}} ] }
-  ],
+  "conversationId": "uuid-del-conversation-en-pausa",
   "decisions": [ { "toolCallId": "call_1", "approved": true } ]
 }
 ```
 
+No reenvíes historial: el backend recupera el estado canónico de la conversación
+desde la base de datos. Usa el `conversationId` que te devolvió la pausa.
+
 Respuesta: mismo shape `ChatResponse`. Puede volver a pausar (el modelo pidió
-otra herramienta destructiva) → repite el ciclo.
+otra herramienta destructiva) → repite el ciclo con el mismo `conversationId`.
 
 | approved | Efecto |
 |---|---|
 | `true` | La tool se ejecuta **exactamente una vez** y el loop continúa hasta `end_turn` |
 | `false` | No se ejecuta nada; el modelo recibe `REJECTED_BY_USER` y comunica la cancelación |
 
-### Checklist de validación (todo esto da `400`, antes de llamar al LLM)
+### Errores y aristas (`400`, antes de llamar al LLM)
 
-- [ ] El historial contiene las toolCalls pendientes **sin responder** (sin mensaje `role:'tool'` con ese `toolCallId`)
-- [ ] `decisions` cubre **exactamente** ese set — sin faltantes, extras ni duplicados
-- [ ] Las tools referenciadas existen y requieren aprobación (hoy: solo `delete_ticket`)
+- [ ] `conversationId` no existe, no pertenece al tenant, o no tiene pausa pendiente → `400`
+- [ ] Algún `toolCallId` de `decisions` no está pendiente (duplicado, repetido, inventado) → `400`
+- [ ] `decisions` está vacío habiendo calls pendientes → esos calls pendientes se descartan como `REJECTED_BY_USER` (el modelo los ve rechazados y continúa; NO rompen la reanudación)
+- [ ] Las tools referenciadas tienen un estado correcto (solo `delete_ticket` requiere aprobación)
 - Sin JWT → `401`. Payload malformado → `400` (pipe). Ticket de otro tenant → `success:false code:'NOT_FOUND'` dentro de `toolResults` (no es 403).
 
-> Regla de oro: **persiste el historial tal cual** y reenvíalo íntegro. Nunca
-> inventes ni edites toolCalls/ids — el backend valida contra falsificación.
+> Regla de oro: **no inventes `conversationId`**; usa el que devolvió el backend.
+> El estado vive en el servidor, así que no puedes falsificar toolCalls/ids.
 
 ## 7. Salud y operación
 
@@ -199,8 +206,8 @@ otra herramienta destructiva) → repite el ciclo.
 | GET | `/auth/me` | ✅ | Perfil |
 | GET | `/health` | — | Status DB |
 | CRUD | `/tickets` | ✅ | Tickets del tenant |
-| POST | `/chat` | ✅ | Agent loop (stateless) |
+| POST | `/chat` | ✅ | Agent loop (persistencia server-side) |
 | POST | `/chat/approve` | ✅ | Reanudar tras aprobación humana |
 
 ---
-*Última actualización: 2026-08-21 · Backend: NestJS 11 · Tests: 92 unit + 41 e2e verdes*
+*Última actualización: 2026-08-31 · Backend: NestJS 11 · Tests: 92 unit + 41 e2e verdes*

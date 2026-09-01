@@ -44,8 +44,9 @@ model Tenant {
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
-  tickets Ticket[]
-  users   User[]
+  tickets       Ticket[]
+  users         User[]
+  conversations Conversation[]
 }
 
 /// Tenant-owned model. Always accessed through the tenant-scoped client.
@@ -76,4 +77,28 @@ model User {
   tenant Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
 
   @@index([tenantId])
+}
+
+enum ConversationStatus {
+  ACTIVE
+  PAUSED
+  COMPLETED
+}
+
+/// Tenant-owned model. Server-side persistence of an agent conversation.
+/// The harness (AgentService) owns this state, so the message history is always
+/// consistent: every assistant toolCall stays paired with its tool result.
+/// Accessed exclusively through the tenant-scoped client.
+model Conversation {
+  id        String             @id @default(uuid())
+  tenantId  String
+  userId    String?
+  messages  Json
+  status    ConversationStatus @default(ACTIVE)
+  createdAt DateTime           @default(now())
+  updatedAt DateTime           @updatedAt
+
+  tenant Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  @@index([tenantId, updatedAt])
 }

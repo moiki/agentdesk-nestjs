@@ -13,15 +13,17 @@ export class ChatController {
       dto.message,
       dto.conversationHistory,
       dto.systemPrompt,
+      dto.conversationId,
     );
   }
 
   /**
-   * Human-in-the-loop resume. JWT required (not in PUBLIC_PATHS). The client
-   * replays the paused conversation state plus one decision per pending call.
+   * Human-in-the-loop resume. JWT required (not in PUBLIC_PATHS). The server
+   * loads the canonical, persisted conversation state and applies the client's
+   * decisions on top of it — the client can no longer corrupt context.
    */
   @Post('approve')
   async approve(@Body() dto: ApproveChatDto) {
-    return this.agent.approve(dto.conversationHistory, dto.decisions);
+    return this.agent.approve(dto.conversationId, dto.decisions);
   }
 }
