@@ -74,9 +74,25 @@ model User {
   createdAt    DateTime @default(now())
   updatedAt    DateTime @updatedAt
 
-  tenant Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  tenant        Tenant         @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  refreshTokens RefreshToken[]
 
   @@index([tenantId])
+}
+
+/// Refresh-token registry — NOT tenant-scoped. Enables stateless access tokens
+/// with rotating, revocable refresh tokens held in an HttpOnly cookie so the
+/// session survives tab switches and page reloads without exposing the token
+/// to JavaScript.
+model RefreshToken {
+  id        String   @id @default(uuid())
+  tokenHash String   @unique
+  userId    String
+  expiresAt DateTime
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
 }
 
 enum ConversationStatus {

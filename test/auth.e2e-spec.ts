@@ -160,4 +160,73 @@ describe('Auth flow (e2e)', () => {
     expect(user?.passwordHash).toBeDefined();
     expect(user?.passwordHash).not.toBe('password123');
   });
+
+  it('sets HttpOnly session cookies on login', async () => {
+    await signupAndAuth(httpServer, {
+      email: 'cookies@auth.test',
+      workspaceName: 'cookie-login',
+    });
+
+    const res = await request(httpServer)
+      .post('/auth/login')
+      .send({ email: 'cookies@auth.test', password: 'password123' })
+      .expect(200);
+
+    const setCookie = res.headers['set-cookie'] as unknown as string[];
+    const joined = setCookie.join('; ');
+    expect(joined).toContain('access_token=');
+    expect(joined).toContain('refresh_token=');
+    expect(joined).toContain('HttpOnly');
+  });
+
+  it('keeps the session authenticated via cookies (no bearer header)', async () => {
+    const email = 'cookie-session@auth.test';
+    const workspaceName = 'cookie-session';
+    await signupAndAuth(httpServer, { email, workspaceName });
+
+    const agent = request.agent(httpServer);
+    await agent.post('/auth/login').send({ email, password: 'password123' }).expect(200);
+
+    const me = await agent.get('/auth/me').expect(200);
+    expect(me.body.email).toBe(email);
+    expect(me.body.role).toBe('ADMIN');
+  });
+
+  it('rotates the refresh token on /auth/refresh and persists session across reloads', async () => {
+    const email = 'rotating@auth.test';
+    const workspaceName = 'rotating';
+    await signupAndAuth(httpServer, { email, workspaceName });
+
+    const agent = request.agent(httpServer);
+    await agent.post('/auth/login').send({ email, password: 'password123' }).expect(200);
+
+    const refreshRes = await agent.post('/auth/refresh').expect(200);
+    expect(refreshRes.body.accessToken).toBeDefined();
+
+    const me = await agent.get('/auth/me').expect(200);
+    expect(me.body.email).toBe(email);
+  });
+
+  it('logs out by invalidating the refresh token', async () => {
+    const email = 'logout@auth.test';
+    const workspaceName = 'logout-flow';
+    await signupAndAuth(httpServer, { email, workspaceName });
+
+    const res = await request(httpServer)
+      .post('/auth/login')
+      .send({ email, password: 'password123' })
+      .expect(200);
+
+    const setCookie = res.headers['set-cookie'] as unknown as string[];
+
+    await request(httpServer)
+      .post('/auth/logout')
+      .set('Cookie', setCookie)
+      .expect(200);
+
+    const remaining = await prisma.refreshToken.findMany({
+      where: { user: { email } },
+    });
+    expect(remaining.length).toBe(0);
+  });
 });

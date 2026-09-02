@@ -14,11 +14,18 @@ const UUID_PATTERN =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 /**
- * Routes that never require an authenticated tenant: platform health and the
- * self-service onboarding flow itself. Must stay in sync with the public
- * controllers (health, signup, auth/login).
+ * Routes that never require an authenticated tenant: platform health, the
+ * self-service onboarding flow itself, and cookie-based session endpoints
+ * (refresh/logout authenticate via the refresh cookie, not the bearer token).
+ * Must stay in sync with the public controllers (health, signup, auth/login).
  */
-export const PUBLIC_PATHS = ['/health', '/signup', '/auth/login'];
+export const PUBLIC_PATHS = [
+  '/health',
+  '/signup',
+  '/auth/login',
+  '/auth/refresh',
+  '/auth/logout',
+];
 
 /**
  * Authentication + tenant context middleware (single enforcement point).
@@ -46,7 +53,7 @@ export class AuthContextMiddleware implements NestMiddleware {
       return tenantContextStore.run({ tenantId: devTenantId }, () => next());
     }
 
-    const token = this.extractBearer(req);
+    const token = this.extractBearer(req) ?? this.extractCookie(req);
     if (!token) {
       throw new UnauthorizedException('Missing bearer token');
     }
@@ -93,5 +100,16 @@ export class AuthContextMiddleware implements NestMiddleware {
       return undefined;
     }
     return header.slice('Bearer '.length).trim();
+  }
+
+  /**
+   * Session fallback: read the short-lived access token from an HttpOnly
+   * cookie when no Authorization header is sent. This is what keeps a session
+   * working across tabs and after a page reload.
+   */
+  private extractCookie(req: Request): string | undefined {
+    const cookies = req.cookies as Record<string, string> | undefined;
+    const token = cookies?.['access_token'];
+    return typeof token === 'string' && token.length > 0 ? token : undefined;
   }
 }

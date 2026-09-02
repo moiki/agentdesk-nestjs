@@ -22,6 +22,19 @@ export const ENV = {
   JWT_SECRET_SET: process.env.JWT_SECRET !== undefined,
   JWT_EXPIRES_IN: process.env.JWT_EXPIRES_IN ?? '1h',
 
+  // Cookie-based session: HttpOnly cookies are shared across tabs and survive
+  // reloads, which is what persists the login between tabs. The access token
+  // cookie is short-lived; the refresh cookie is long-lived and rotated.
+  COOKIE_ACCESS_TTL_MS: Number(
+    process.env.COOKIE_ACCESS_TTL_MS ?? 60 * 60 * 1000,
+  ), // 1h
+  COOKIE_REFRESH_TTL_MS: Number(
+    process.env.COOKIE_REFRESH_TTL_MS ?? 30 * 24 * 60 * 60 * 1000, // 30d
+  ),
+  COOKIE_SECURE: process.env.COOKIE_SECURE === 'true',
+  COOKIE_SAME_SITE: (process.env.COOKIE_SAME_SITE ?? 'lax') as
+    'lax' | 'strict' | 'none',
+
   THROTTLE_TTL_MS: Number(process.env.THROTTLE_TTL_MS ?? 60_000),
   THROTTLE_LIMIT: Number(process.env.THROTTLE_LIMIT ?? 100),
 

@@ -79,7 +79,9 @@ All compose variables are fed from the `.env` file (create one from `.env.exampl
 |--------|------------------|---------|-----------------------------------------------------|
 | GET    | `/health`        | public  | Health check                                        |
 | POST   | `/signup`        | public  | Self-service onboarding `{ companyName, workspaceName, adminEmail, adminPassword, plan? }` |
-| POST   | `/auth/login`    | public  | Login `{ email, password }` → `{ accessToken }`     |
+| POST   | `/auth/login`    | public  | Login `{ email, password }` → `{ accessToken }` + HttpOnly session cookies |
+| POST   | `/auth/refresh`  | public  | Rotate the refresh cookie → new `{ accessToken }` (persists session across tabs/reloads) |
+| POST   | `/auth/logout`   | public  | Invalidate the refresh token and clear session cookies |
 | GET    | `/auth/me`       | auth    | User + tenant profile (`role`, `plan`, ...)         |
 | POST   | `/tickets`       | tenant  | Create a ticket `{ title }`                         |
 | GET    | `/tickets`       | tenant  | List active tenant tickets (`?status=`)             |
@@ -89,7 +91,32 @@ All compose variables are fed from the `.env` file (create one from `.env.exampl
 | POST   | `/chat`          | auth    | Agent loop `{ message, systemPrompt?, conversationId? }` → agent response + `conversationId` |
 | POST   | `/chat/approve`  | auth    | Resume after approval pause `{ conversationId, decisions }` → agent response |
 
-Tenant identity comes from the JWT (`Authorization: Bearer <token>`), never from the body. Public routes: `/health`, `/signup`, `/auth/login`.
+Tenant identity comes from the JWT (`Authorization: Bearer <token>` or the HttpOnly `access_token` cookie), never from the body. Public routes: `/health`, `/signup`, `/auth/login`, `/auth/refresh`, `/auth/logout`.
+
+### Session persistence (cookies)
+
+Sessions are kept in **HttpOnly cookies** set on login, so they survive opening
+new tabs and page reloads without the client re-sending credentials:
+
+- `access_token` — short-lived JWT (default 1h), read by the middleware when no
+  `Authorization` header is present.
+- `refresh_token` — long-lived (default 30d), rotating, revocable. Also stored
+  hashed in the `RefreshToken` table (single-use: each `/auth/refresh` consumes
+  and re-issues it).
+
+On app boot the frontend should call `POST /auth/refresh` (which only needs the
+refresh cookie) to obtain a fresh access token. `POST /auth/logout` revokes all
+refresh tokens for the user and clears the cookies.
+
+```bash
+COOKIE_ACCESS_TTL_MS=3600000      # access cookie lifetime (default 1h)
+COOKIE_REFRESH_TTL_MS=2592000000  # refresh cookie lifetime (default 30d)
+COOKIE_SECURE=false               # true in production (HTTPS only)
+COOKIE_SAME_SITE=lax              # lax | strict | none
+```
+
+CORS `credentials` is already enabled, so the cookies work cross-origin (e.g.
+FE on `localhost:5173` → API on `localhost:3000`).
 
 ## Agent loop
 
