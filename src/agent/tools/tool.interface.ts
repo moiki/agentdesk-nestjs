@@ -6,7 +6,11 @@ import { z } from 'zod';
  * non-recoverable ones (retrying won't help).
  */
 export type ToolErrorCode =
-  'NOT_FOUND' | 'VALIDATION_ERROR' | 'INTERNAL_ERROR' | 'REJECTED_BY_USER';
+  | 'NOT_FOUND'
+  | 'VALIDATION_ERROR'
+  | 'INTERNAL_ERROR'
+  | 'REJECTED_BY_USER'
+  | 'CONFLICT';
 
 export interface ToolError {
   code: ToolErrorCode;
@@ -22,11 +26,16 @@ export interface Tool {
   name: string;
   description: string;
   inputSchema: z.ZodTypeAny;
-  /** Whether this tool mutates state. Used for idempotency and parallelism. */
+  /**
+   * Whether this tool mutates state. Used for idempotency and parallelism.
+   */
   mutating?: boolean;
   /** If true, the agent loop pauses and requests human approval before executing. */
   requiresApproval?: boolean;
-  execute(input: Record<string, unknown>): Promise<ToolResult>;
+  execute(
+    input: Record<string, unknown>,
+    toolCallId?: string,
+  ): Promise<ToolResult>;
 }
 
 export type ToolResult =

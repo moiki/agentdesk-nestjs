@@ -53,7 +53,25 @@ describe('TicketTools', () => {
 
       const result = await registry.execute('create_ticket', { title: 'Help' });
       expect(result).toEqual({ success: true, data: fakeTicket });
-      expect(mockTicketsService.create).toHaveBeenCalledWith({ title: 'Help' });
+      expect(mockTicketsService.create).toHaveBeenCalledWith(
+        { title: 'Help' },
+        undefined,
+      );
+    });
+
+    it('passes the toolCallId as the idempotency key', async () => {
+      ticketTools.onModuleInit();
+      mockTicketsService.create.mockResolvedValue({
+        id: 't1',
+        title: 'Help',
+        status: 'OPEN',
+      });
+
+      await registry.execute('create_ticket', { title: 'Help' }, 'call-123');
+      expect(mockTicketsService.create).toHaveBeenCalledWith(
+        { title: 'Help' },
+        'call-123',
+      );
     });
 
     it('is marked as mutating', () => {
@@ -159,6 +177,28 @@ describe('TicketTools', () => {
         success: false,
         error: { code: 'NOT_FOUND', message: 'Ticket not found' },
       });
+    });
+
+    it('passes the optimistic version and maps a lost-update conflict to CONFLICT', async () => {
+      ticketTools.onModuleInit();
+      mockTicketsService.update.mockRejectedValue(
+        new Error('Ticket was modified by another request. Please retry.'),
+      );
+
+      const result = await registry.execute('update_ticket', {
+        ticketId: '550e8400-e29b-41d4-a716-446655440000',
+        title: 'New',
+        version: 2,
+      });
+      expect(result.success).toBe(false);
+      if (!result.success) {
+        expect(result.error.code).toBe('CONFLICT');
+      }
+      expect(mockTicketsService.update).toHaveBeenCalledWith(
+        '550e8400-e29b-41d4-a716-446655440000',
+        { title: 'New', version: 2 },
+        2,
+      );
     });
 
     it('is marked as mutating', () => {

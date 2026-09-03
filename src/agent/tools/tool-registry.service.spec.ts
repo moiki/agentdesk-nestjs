@@ -148,4 +148,43 @@ describe('ToolRegistry', () => {
     const result = await registry.execute('test_tool', { input: 'x' });
     expect(result).toEqual({ success: true, data: 'small' });
   });
+
+  it('replays a cached result for a repeated toolCallId (dedup)', async () => {
+    let calls = 0;
+    registry.register(
+      makeTool({
+        execute: () => {
+          calls += 1;
+          return Promise.resolve({ success: true, data: `call-${calls}` });
+        },
+      }),
+    );
+
+    const first = await registry.execute('test_tool', { input: 'x' }, 'call-a');
+    const second = await registry.execute(
+      'test_tool',
+      { input: 'x' },
+      'call-a',
+    );
+
+    expect(calls).toBe(1);
+    expect(second).toEqual(first);
+  });
+
+  it('executes independently for distinct toolCallIds', async () => {
+    let calls = 0;
+    registry.register(
+      makeTool({
+        execute: () => {
+          calls += 1;
+          return Promise.resolve({ success: true, data: `call-${calls}` });
+        },
+      }),
+    );
+
+    await registry.execute('test_tool', { input: 'x' }, 'id-1');
+    await registry.execute('test_tool', { input: 'x' }, 'id-2');
+
+    expect(calls).toBe(2);
+  });
 });

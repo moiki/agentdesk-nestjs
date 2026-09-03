@@ -11,6 +11,7 @@ import { ConversationService } from './conversation.service';
 import { ConversationStatus } from '../generated/prisma/client';
 import { TenantPromptService } from './prompts/tenant-prompt.service';
 import { TenantScopedPrismaService } from '../tenancy/tenant-scoped-prisma.service';
+import { TracingService } from '../tracing/tracing.service';
 import { DEFAULT_IDENTITY_PROMPT } from './prompts/identity.prompt';
 
 /**
@@ -20,36 +21,88 @@ import { DEFAULT_IDENTITY_PROMPT } from './prompts/identity.prompt';
 class FakeConversationService {
   private store = new Map<
     string,
-    { messages: ChatMessage[]; status: ConversationStatus }
+    {
+      messages: ChatMessage[];
+      status: ConversationStatus;
+      version: number;
+      idempotencyKey?: string;
+    }
   >();
   private seq = 0;
 
-  async create(messages: ChatMessage[], _opts?: { userId?: string }) {
+  create(
+    messages: ChatMessage[],
+    opts?: { userId?: string; idempotencyKey?: string },
+  ) {
     const id = `conv-${++this.seq}`;
-    this.store.set(id, { messages, status: ConversationStatus.ACTIVE });
+    const key = opts?.idempotencyKey;
+    if (key) {
+      for (const [, row] of this.store) {
+        if (row.idempotencyKey === key) {
+          const err: any = new Error('Unique constraint');
+          err.code = 'P2002';
+          throw err;
+        }
+      }
+    }
+    this.store.set(id, {
+      messages,
+      status: ConversationStatus.ACTIVE,
+      version: 0,
+      idempotencyKey: key,
+    });
     return { id, messages };
   }
 
-  async find(id: string) {
+  findByIdempotencyKey(key: string) {
+    for (const [id, row] of this.store) {
+      if (row.idempotencyKey === key) {
+        return { id, messages: row.messages };
+      }
+    }
+    return null;
+  }
+
+  find(id: string) {
     const row = this.store.get(id);
     if (!row) {
       const err: any = new Error('Conversation not found');
       err.status = 404;
       throw err;
     }
-    return { id, messages: row.messages, status: row.status };
+    return {
+      id,
+      messages: row.messages,
+      status: row.status,
+      version: row.version,
+    };
   }
 
-  async updateMessages(
+  updateMessages(
     id: string,
     messages: ChatMessage[],
     status?: ConversationStatus,
+    expectedVersion?: number,
   ) {
     const row = this.store.get(id);
     if (!row) throw new Error('Conversation not found');
+    if (expectedVersion !== undefined && row.version !== expectedVersion) {
+      throw new Error('Conversation was modified concurrently');
+    }
     row.messages = messages;
     if (status) row.status = status;
+    row.version += 1;
     return messages;
+  }
+
+  setStatus(id: string, status: ConversationStatus, expectedVersion?: number) {
+    const row = this.store.get(id);
+    if (!row) throw new Error('Conversation not found');
+    if (expectedVersion !== undefined && row.version !== expectedVersion) {
+      throw new Error('Conversation was modified concurrently');
+    }
+    row.status = status;
+    row.version += 1;
   }
 
   toMessages(value: unknown): ChatMessage[] {
@@ -59,7 +112,11 @@ class FakeConversationService {
   /* Test helpers */
   seed(messages: ChatMessage[]): string {
     const id = `conv-${++this.seq}`;
-    this.store.set(id, { messages, status: ConversationStatus.PAUSED });
+    this.store.set(id, {
+      messages,
+      status: ConversationStatus.PAUSED,
+      version: 0,
+    });
     return id;
   }
 }
@@ -118,6 +175,7 @@ describe('AgentService', () => {
         { provide: ConversationService, useValue: conversations },
         TenantPromptService,
         { provide: TenantScopedPrismaService, useValue: fakeScopedPrisma },
+        TracingService,
       ],
     }).compile();
 
@@ -795,5 +853,65 @@ describe('AgentService', () => {
       expect(executed).toBe(true);
       expect(result.toolResults.map((r) => r.id)).toEqual(['c2']);
     });
+  });
+
+  it('reuses the original conversation when /chat retries with the same idempotencyKey', async () => {
+    fakeLlm.add({ match: {}, response: endTurnResponse('Hello!') });
+    fakeLlm.add({ match: {}, response: endTurnResponse('Hello again!') });
+
+    const first = await agent.chat(
+      'hi',
+      undefined,
+      undefined,
+      undefined,
+      'key-123',
+    );
+    const second = await agent.chat(
+      'hi',
+      undefined,
+      undefined,
+      undefined,
+      'key-123',
+    );
+
+    // No duplicate conversation row is created for the retried key.
+    expect(first.conversationId).toBe(second.conversationId);
+  });
+
+  it('executes a mutating tool once per distinct tool call (no cross-turn dedup)', async () => {
+    const executeIds: string[] = [];
+    registry.register({
+      name: 'create_ticket',
+      description: 'create',
+      inputSchema: {
+        safeParse: () => ({ success: true, data: { title: 'x' } }),
+      } as any,
+      execute: () => {
+        executeIds.push('x');
+        return Promise.resolve({ success: true, data: { id: 't1' } });
+      },
+    });
+
+    fakeLlm.addCassettes([
+      {
+        match: { includesText: 'first', hasToolCalls: false },
+        response: toolUseResponse('create_ticket', { title: 'x' }),
+      },
+      { match: { hasToolCalls: true }, response: endTurnResponse('done 1') },
+      {
+        match: { includesText: 'second', hasToolCalls: false },
+        response: toolUseResponse('create_ticket', { title: 'x' }),
+      },
+      { match: { hasToolCalls: true }, response: endTurnResponse('done 2') },
+    ]);
+
+    // Two fresh conversations issuing the same mutating call. Because each
+    // tool call gets its own unique id, the dedup cache must NOT replay the
+    // first turn's result into the second conversation.
+    const first = await agent.chat('first');
+    const second = await agent.chat('second');
+
+    expect(executeIds).toHaveLength(2);
+    expect(first.conversationId).not.toBe(second.conversationId);
   });
 });

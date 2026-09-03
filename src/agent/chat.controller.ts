@@ -14,6 +14,7 @@ export class ChatController {
       dto.conversationHistory,
       dto.systemPrompt,
       dto.conversationId,
+      dto.idempotencyKey,
     );
   }
 

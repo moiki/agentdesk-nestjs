@@ -1,4 +1,9 @@
-import { Injectable, Logger, NotFoundException } from '@nestjs/common';
+import {
+  ConflictException,
+  Injectable,
+  Logger,
+  NotFoundException,
+} from '@nestjs/common';
 import { getTenantId } from '../tenancy/tenant-context';
 import { TenantScopedPrismaService } from '../tenancy/tenant-scoped-prisma.service';
 import type { ChatMessage } from '../llm/llm.types';
@@ -46,13 +51,14 @@ export class ConversationService {
   /** Creates a new conversation with an initial message history (or empty). */
   async create(
     messages: ChatMessage[],
-    opts: { userId?: string } = {},
+    opts: { userId?: string; idempotencyKey?: string } = {},
   ): Promise<ConversationIdAndMessages> {
     const tenantId = getTenantId()!;
     const conversation = await this.db.conversation.create({
       data: {
         tenantId,
         userId: opts.userId ?? null,
+        idempotencyKey: opts.idempotencyKey ?? null,
         messages: toJsonValue(messages),
         status: ConversationStatus.ACTIVE,
       },
@@ -63,27 +69,89 @@ export class ConversationService {
     };
   }
 
-  /** Replaces the stored message history atomically and returns it. */
+  /**
+   * Finds the conversation created with a given client-supplied idempotency key
+   * (scoped to the active tenant). Returns null when none exists. Used to
+   * recover the original conversation when a retried /chat hits the unique
+   * constraint instead of creating a duplicate thread.
+   */
+  async findByIdempotencyKey(
+    idempotencyKey: string,
+  ): Promise<{ id: string; messages: ChatMessage[] } | null> {
+    const conversation = await this.db.conversation.findFirst({
+      where: { idempotencyKey },
+    });
+    if (!conversation) return null;
+    return {
+      id: conversation.id,
+      messages: conversation.messages as unknown as ChatMessage[],
+    };
+  }
+
+  /**
+   * Replaces the stored message history and returns it.
+   *
+   * When `expectedVersion` is supplied the write is a compare-and-swap: it only
+   * applies if the row's current `version` matches, then increments it. A
+   * mismatch (a concurrent writer slipped past the agent-loop mutex) throws 409.
+   * Without a version the write is unconditional (backwards compatible).
+   */
   async updateMessages(
     id: string,
     messages: ChatMessage[],
     status?: ConversationStatus,
+    expectedVersion?: number,
   ): Promise<ChatMessage[]> {
+    if (expectedVersion !== undefined) {
+      const result = await this.db.conversation.updateMany({
+        where: { id, version: expectedVersion },
+        data: {
+          messages: toJsonValue(messages),
+          ...(status ? { status } : {}),
+          version: { increment: 1 },
+        },
+      });
+      if (result.count === 0) {
+        throw new ConflictException(
+          'Conversation was modified concurrently. Please retry.',
+        );
+      }
+      return messages;
+    }
+
     const saved = await this.db.conversation.update({
       where: { id },
       data: {
         messages: toJsonValue(messages),
         ...(status ? { status } : {}),
+        version: { increment: 1 },
       },
     });
     return saved.messages as unknown as ChatMessage[];
   }
 
   /** Marks a conversation as paused (awaiting approval) or completed. */
-  async setStatus(id: string, status: ConversationStatus): Promise<void> {
+  async setStatus(
+    id: string,
+    status: ConversationStatus,
+    expectedVersion?: number,
+  ): Promise<void> {
+    if (expectedVersion !== undefined) {
+      const result = await this.db.conversation.updateMany({
+        where: { id, version: expectedVersion },
+        data: { status, version: { increment: 1 } },
+      });
+      if (result.count === 0) {
+        throw new ConflictException(
+          'Conversation was modified concurrently. Please retry.',
+        );
+      }
+      return;
+    }
+
     await this.db.conversation.update({
       where: { id },
-      data: { status },
+      data: { status, version: { increment: 1 } },
     });
   }
 
@@ -92,7 +160,9 @@ export class ConversationService {
     if (Array.isArray(value)) {
       return value as ChatMessage[];
     }
-    this.logger.warn('Stored conversation.messages is not an array; resetting.');
+    this.logger.warn(
+      'Stored conversation.messages is not an array; resetting.',
+    );
     return [];
   }
 }

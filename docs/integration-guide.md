@@ -70,8 +70,15 @@ Reglas:
 | `POST /tickets` | auth | `{ title }` → `201 Ticket` |
 | `GET /tickets` | auth | `?status=OPEN\|IN_PROGRESS\|RESOLVED\|CLOSED` (único filtro) |
 | `GET /tickets/:id` | auth | Otro tenant → `404` (no revela existencia) |
-| `PATCH /tickets/:id` | auth | `{ title?, status? }` |
+| `PATCH /tickets/:id` | auth | `{ title?, status?, version? }` — si envías `version`, el update es optimist (ver nota abajo) |
 | `DELETE /tickets/:id` | auth | Borra directo (sin aprobación vía REST; la aprobación aplica solo al agente) |
+
+> **Optimistic locking en `PATCH /tickets/:id`:** cada ticket tiene una columna
+> `version` (empieza en `0`). Si el request incluye `version`, el update falla con
+> `409 Conflict` cuando la fila ya fue modificada por otro request (lost-update
+> detection). El cliente debe releer el ticket con su `version` actual y reintentar.
+> Sin `version`, el update se aplica sin control de concurrencia (comportamiento
+> previo).
 
 ## 5. Chat con persistencia server-side (`POST /chat`)
 
@@ -92,6 +99,18 @@ recarga.
   "conversationId": "uuid-de-la-conversacion"
 }
 ```
+
+> **Idempotencia en retries (`idempotencyKey`):** si adelantas un `POST /chat`
+> y el cliente lo reintenta (timeout, red), envía el mismo `idempotencyKey`
+> (string ≤128 chars) en el reintento. El backend reutiliza la conversación
+> original en vez de crear una duplicada. Además, `create_ticket` **estampa
+> cada ticket con el `toolCallId`** de la tool call y lo protege con un índice
+> único por tenant en DB — así un reintento del mismo efecto que llegue en un
+> proceso completamente nuevo (donde el dedup en memoria ya no existe) devuelve
+> el ticket ya creado en vez de duplicarlo. Concurrencia real: el servidor
+> serializa los turnos de una misma conversación con un mutex por conversación,
+> y detecta lost-updates con optimistic locking en caso de que dos procesos
+> colisionen.
 
 > **System prompt por tenant:** el backend compone automáticamente el prompt de
 > cada agente combinando la identidad de AgentDesk con el contexto de la compañía
@@ -132,13 +151,15 @@ Notas:
 
 | Tool | Efecto | Flags |
 |---|---|---|
-| `create_ticket` | Crea ticket | mutating |
+| `create_ticket` | Crea ticket (idempotente por `toolCallId` en DB) | mutating |
 | `list_tickets` / `get_ticket` | Lectura | read-only (paralelizables) |
-| `update_ticket` | Cambia título/estado | mutating |
+| `update_ticket` | Cambia título/estado (`version?` para CAS optimista) | mutating |
 | `delete_ticket` | **Elimina** | mutating + **requiresApproval** |
 
 Los errores de tool NO son errores HTTP: llegan dentro de `toolResults[].result.code`
-(`NOT_FOUND | VALIDATION_ERROR | INTERNAL_ERROR | REJECTED_BY_USER`) con `success:false`.
+(`NOT_FOUND | VALIDATION_ERROR | INTERNAL_ERROR | REJECTED_BY_USER | CONFLICT`) con `success:false`.
+`CONFLICT` indica un lost-update (la `version` enviada en `update_ticket` quedó obsoleta) —
+el agente debe releer el estado actual antes de reintentar.
 
 ## 6. Approval flow — human-in-the-loop ⭐
 

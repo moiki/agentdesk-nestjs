@@ -11,8 +11,11 @@ const TicketStatusEnum = z.enum(['OPEN', 'IN_PROGRESS', 'RESOLVED', 'CLOSED']);
  * Zod and delegates to the tenant-scoped service — the ALS context is already
  * set by AuthContextMiddleware before the agent loop runs.
  *
- * Mutating tools (create, update, delete) include idempotency via toolCallId
- * to prevent duplicate side-effects from retries.
+ * Side-effect safety: the ToolRegistry dedups by toolCallId within a turn, and
+ * `create_ticket` additionally stamps its ticket with the toolCallId so the DB
+ * unique constraint (mecanismo 2) prevents duplicates even across a fresh
+ * process/turn. `update_ticket` uses an optimistic version check for lost
+ * updates; `delete_ticket` is guarded by the approval flow.
  */
 @Injectable()
 export class TicketTools {
@@ -37,10 +40,13 @@ export class TicketTools {
         inputSchema: z.object({
           title: z.string().min(1).describe('Short title for the ticket'),
         }),
-        execute: async (input) => {
-          const ticket = await this.tickets.create({
-            title: input.title as string,
-          });
+        execute: async (input, toolCallId) => {
+          const ticket = await this.tickets.create(
+            {
+              title: input.title as string,
+            },
+            toolCallId,
+          );
           return { success: true, data: ticket };
         },
       },
@@ -90,24 +96,43 @@ export class TicketTools {
           ticketId: z.string().uuid().describe('UUID of the ticket'),
           title: z.string().min(1).optional().describe('New title'),
           status: TicketStatusEnum.optional().describe('New status'),
+          version: z
+            .number()
+            .int()
+            .min(0)
+            .optional()
+            .describe(
+              'Current ticket version for optimistic locking. Include it to avoid overwriting concurrent edits.',
+            ),
         }),
         execute: async (input) => {
           try {
-            const ticket = await this.tickets.update(input.ticketId as string, {
-              ...(input.title !== undefined && {
-                title: input.title as string,
-              }),
-              ...(input.status !== undefined && {
-                status: input.status as
-                  'OPEN' | 'IN_PROGRESS' | 'RESOLVED' | 'CLOSED',
-              }),
-            });
+            const ticket = await this.tickets.update(
+              input.ticketId as string,
+              {
+                ...(input.title !== undefined && {
+                  title: input.title as string,
+                }),
+                ...(input.status !== undefined && {
+                  status: input.status as
+                    'OPEN' | 'IN_PROGRESS' | 'RESOLVED' | 'CLOSED',
+                }),
+                ...(input.version !== undefined && {
+                  version: input.version as number,
+                }),
+              },
+              input.version !== undefined
+                ? (input.version as number)
+                : undefined,
+            );
             return { success: true, data: ticket };
           } catch (err) {
             const message = err instanceof Error ? err.message : String(err);
             const code = message.toLowerCase().includes('not found')
               ? ('NOT_FOUND' as const)
-              : ('INTERNAL_ERROR' as const);
+              : message.toLowerCase().includes('modified by another')
+                ? ('CONFLICT' as const)
+                : ('INTERNAL_ERROR' as const);
             return { success: false, error: { code, message } };
           }
         },

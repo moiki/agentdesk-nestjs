@@ -1,4 +1,11 @@
-import { IsEnum, IsOptional, IsString, MinLength } from 'class-validator';
+import {
+  IsEnum,
+  IsInt,
+  IsOptional,
+  IsString,
+  Min,
+  MinLength,
+} from 'class-validator';
 import { TicketStatus } from '../../generated/prisma/client';
 
 export class UpdateTicketDto {
@@ -10,4 +17,9 @@ export class UpdateTicketDto {
   @IsOptional()
   @IsEnum(TicketStatus)
   status?: TicketStatus;
+
+  @IsOptional()
+  @IsInt()
+  @Min(0)
+  version?: number;
 }

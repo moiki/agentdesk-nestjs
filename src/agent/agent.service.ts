@@ -1,6 +1,7 @@
 import { BadRequestException, Injectable, Logger } from '@nestjs/common';
 import { Inject } from '@nestjs/common';
 import { EventEmitter2 } from '@nestjs/event-emitter';
+import { Mutex } from 'async-mutex';
 import { ENV } from '../common/constants';
 import type { LlmProvider } from '../llm/llm-provider.interface';
 import { LLM_PROVIDER } from '../llm/llm.module';
@@ -11,12 +12,16 @@ import type {
   LlmUsage,
 } from '../llm/llm.types';
 import { ToolRegistry } from './tools/tool-registry.service';
+import type { ToolResult } from './tools/tool.interface';
 import { ConversationService } from './conversation.service';
 import { ConversationStatus } from '../generated/prisma/client';
 import { getTenantContext } from '../tenancy/tenant-context';
 import { TenantScopedPrismaService } from '../tenancy/tenant-scoped-prisma.service';
 import { TenantPromptService } from './prompts/tenant-prompt.service';
 import type { TenantPromptContext } from './prompts/tenant-prompt.types';
+import { TracingService } from '../tracing/tracing.service';
+import type { TraceObservation } from '../tracing/tracing.service';
+import { isUniqueViolation } from '../common/prisma-error';
 
 export interface ToolCallResult {
   id: string;
@@ -66,6 +71,15 @@ export class AgentService {
   private readonly budget: LoopBudget;
   private readonly maxRetries: number;
 
+  /**
+   * Per-conversation mutexes serializing chat/approve turns on the same
+   * conversation. Prevents concurrent requests from both running the agent
+   * loop and double-executing mutating tools, or one request silently
+   * overwriting another's persisted history. Entries are evicted once no
+   * waiter remains to keep memory flat.
+   */
+  private readonly locks = new Map<string, Mutex>();
+
   constructor(
     @Inject(LLM_PROVIDER) private readonly llm: LlmProvider,
     private readonly registry: ToolRegistry,
@@ -73,6 +87,7 @@ export class AgentService {
     private readonly conversations: ConversationService,
     private readonly tenantPrompts: TenantPromptService,
     private readonly scopedPrisma: TenantScopedPrismaService,
+    private readonly tracing: TracingService,
   ) {
     this.budget = {
       maxIterations: ENV.AGENT_MAX_ITERATIONS,
@@ -94,39 +109,170 @@ export class AgentService {
     conversationHistory?: ChatMessage[],
     systemPrompt?: string,
     conversationId?: string,
+    idempotencyKey?: string,
   ): Promise<ChatResponse> {
-    const existing = conversationId
-      ? await this.loadConversation(conversationId)
-      : await this.conversations.create(conversationHistory ?? [], {
-          userId: getUserId(),
-        });
+    // Continuing an existing thread must be serialized on that conversation so
+    // concurrent /chat and /approve calls can't double-run tools or clobber
+    // each other's persisted history.
+    if (conversationId) {
+      return this.withConversationLock(conversationId, () =>
+        this.runChatTurn(
+          userMessage,
+          conversationHistory,
+          systemPrompt,
+          conversationId,
+          true,
+        ),
+      );
+    }
 
-    const conversationID = existing.id;
-    const messages: ChatMessage[] = [
-      ...(conversationHistory && !conversationId
-        ? conversationHistory
-        : (existing.messages ?? [])),
-      { role: 'user', content: userMessage },
-    ];
-
-    // The system prompt is composed per-tenant by the server. A client-supplied
-    // 'systemPrompt' is treated as optional, capped extra instructions only —
-    // it can no longer hijack the agent's identity.
-    const system = await this.resolveSystemPrompt(systemPrompt);
-
-    return this.runLoop(
-      messages,
-      system,
-      {
-        toolCalls: [],
-        toolResults: [],
-        usage: { inputTokens: 0, outputTokens: 0 },
-        iterations: 0,
-      },
-      conversationID,
-      (next, status) =>
-        this.conversations.updateMessages(conversationID, next, status),
+    // New thread: create it (deduplicating by idempotencyKey on retry), then
+    // run it under the mutex on the resolved conversation.
+    const resolved = await this.createConversationForChat(
+      conversationHistory ?? [],
+      idempotencyKey,
     );
+    return this.withConversationLock(resolved.id, () =>
+      this.runChatTurn(
+        userMessage,
+        conversationHistory,
+        systemPrompt,
+        resolved.id,
+        resolved.isExisting,
+      ),
+    );
+  }
+
+  /**
+   * Creates a new conversation, or resolves to the original one when the client
+   * supplied an `idempotencyKey` that was already used (retried /chat). The
+   * Postgres unique constraint on `(tenantId, idempotencyKey)` is the atomic
+   * guard — exactly one conversation row is ever created per key.
+   */
+  private async createConversationForChat(
+    history: ChatMessage[],
+    idempotencyKey?: string,
+  ): Promise<{ id: string; isExisting: boolean }> {
+    try {
+      const created = await this.conversations.create(history, {
+        userId: getUserId(),
+        idempotencyKey,
+      });
+      return { id: created.id, isExisting: false };
+    } catch (err) {
+      if (idempotencyKey && isUniqueViolation(err)) {
+        const existing =
+          await this.conversations.findByIdempotencyKey(idempotencyKey);
+        if (existing) {
+          return { id: existing.id, isExisting: true };
+        }
+      }
+      throw err;
+    }
+  }
+
+  /** Runs the traced agent turn for a chat message under an acquired lock. */
+  private async runChatTurn(
+    userMessage: string,
+    conversationHistory: ChatMessage[] | undefined,
+    systemPrompt: string | undefined,
+    conversationId: string,
+    reloadFromDb: boolean,
+  ): Promise<ChatResponse> {
+    const ctx = getTenantContext();
+    return this.tracing.traceAgentTurn<ChatResponse>(
+      {
+        name: 'agent-turn',
+        input: userMessage,
+        userId: ctx?.userId,
+        sessionId: conversationId,
+        tags: ['agent-desktop', 'chat'],
+        metadata: { tenantId: ctx?.tenantId ?? '', endpoint: 'chat' },
+      },
+      async (span) => {
+        // Fresh turn: forget any cached tool results from a prior turn so a
+        // reused toolCallId always triggers a real execution.
+        this.registry.startTurn();
+
+        // Base history: persisted state (existing thread) or client history
+        // (fresh thread). The version ref threads optimistic-locking through
+        // every persist so concurrent writers are detected (defense in depth
+        // on top of the mutex).
+        const persisted = reloadFromDb
+          ? await this.loadConversation(conversationId)
+          : null;
+        const base = persisted ? persisted.messages : conversationHistory;
+        const messages: ChatMessage[] = [
+          ...(base ?? []),
+          { role: 'user', content: userMessage },
+        ];
+
+        // The system prompt is composed per-tenant by the server. A
+        // client-supplied 'systemPrompt' is treated as optional, capped extra
+        // instructions only — it can no longer hijack the agent's identity.
+        const system = await this.resolveSystemPrompt(systemPrompt);
+
+        const versionRef = { current: persisted?.version };
+        const response = await this.runLoop(
+          messages,
+          system,
+          {
+            toolCalls: [],
+            toolResults: [],
+            usage: { inputTokens: 0, outputTokens: 0 },
+            iterations: 0,
+          },
+          conversationId,
+          (next, status) =>
+            this.persistConversation(conversationId, next, status, versionRef),
+        );
+        this.setTurnOutput(span, response);
+        return response;
+      },
+    );
+  }
+
+  /**
+   * Persists conversation messages, advancing the optimistic-lock version ref
+   * so the next persist within this turn CAS's against the just-written state.
+   */
+  private async persistConversation(
+    id: string,
+    messages: ChatMessage[],
+    status: ConversationStatus | undefined,
+    versionRef: { current: number | undefined },
+  ): Promise<void> {
+    await this.conversations.updateMessages(
+      id,
+      messages,
+      status,
+      versionRef.current,
+    );
+    if (versionRef.current !== undefined) {
+      versionRef.current += 1;
+    }
+  }
+
+  /**
+   * Serializes a critical section on a conversation via a per-conversation
+   * mutex. Evicts the mutex from the map once no waiter remains.
+   */
+  private async withConversationLock<T>(
+    conversationId: string,
+    fn: () => Promise<T>,
+  ): Promise<T> {
+    let mutex = this.locks.get(conversationId);
+    if (!mutex) {
+      mutex = new Mutex();
+      this.locks.set(conversationId, mutex);
+    }
+    try {
+      return await mutex.runExclusive(fn);
+    } finally {
+      if (!mutex.isLocked && this.locks.get(conversationId) === mutex) {
+        this.locks.delete(conversationId);
+      }
+    }
   }
 
   /**
@@ -143,10 +289,23 @@ export class AgentService {
     conversationId: string,
     decisions: { toolCallId: string; approved: boolean }[],
   ): Promise<ChatResponse> {
+    // Serialize the whole approve flow on the conversation so concurrent
+    // /approve calls can't both execute the same pending tool.
+    return this.withConversationLock(conversationId, () =>
+      this.runApproveTurn(conversationId, decisions),
+    );
+  }
+
+  private async runApproveTurn(
+    conversationId: string,
+    decisions: { toolCallId: string; approved: boolean }[],
+  ): Promise<ChatResponse> {
+    this.registry.startTurn();
     const existing = await this.loadConversation(conversationId);
     const messages: ChatMessage[] = (existing.messages ?? []).map((m) => ({
       ...m,
     }));
+    const versionRef = { current: existing.version };
 
     // Pending = assistant toolCalls without an answering role:'tool' message.
     const answeredIds = new Set(
@@ -213,7 +372,7 @@ export class AgentService {
       acc.toolCalls.push(tc);
 
       const result = approved
-        ? await this.registry.execute(tc.name, tc.arguments)
+        ? await this.executeTracedTool(tc.name, tc.arguments, tc.id)
         : {
             success: false as const,
             error: {
@@ -241,13 +400,31 @@ export class AgentService {
       });
     }
 
-    return this.runLoop(
-      messages,
-      await this.resolveSystemPrompt(),
-      acc,
-      conversationId,
-      (next, status) =>
-        this.conversations.updateMessages(conversationId, next, status),
+    const ctx = getTenantContext();
+    return this.tracing.traceAgentTurn<ChatResponse>(
+      {
+        name: 'agent-turn',
+        input: {
+          conversationId,
+          decisions: decisions.map((d) => d.toolCallId),
+        },
+        userId: ctx?.userId,
+        sessionId: conversationId,
+        tags: ['agent-desktop', 'approval'],
+        metadata: { tenantId: ctx?.tenantId ?? '', endpoint: 'approve' },
+      },
+      async (span) => {
+        const response = await this.runLoop(
+          messages,
+          await this.resolveSystemPrompt(),
+          acc,
+          conversationId,
+          (next, status) =>
+            this.persistConversation(conversationId, next, status, versionRef),
+        );
+        this.setTurnOutput(span, response);
+        return response;
+      },
     );
   }
 
@@ -298,6 +475,51 @@ export class AgentService {
   }
 
   /**
+   * Executes a tool call wrapped in a Langfuse `tool` observation. Records the
+   * outcome (data or error) on the observation so the trace shows exactly what
+   * each tool returned to the model.
+   */
+  private async executeTracedTool(
+    name: string,
+    input: Record<string, unknown>,
+    toolCallId?: string,
+  ): Promise<ToolResult> {
+    const tool = this.tracing.startTool(name, input);
+    try {
+      const result = await this.registry.execute(name, input, toolCallId);
+      tool?.update({
+        output: result.success ? result.data : result.error,
+        level: result.success ? 'DEFAULT' : 'WARNING',
+        statusMessage: result.success
+          ? undefined
+          : (result.error?.message ?? 'Tool call failed'),
+      });
+      tool?.end();
+      return result;
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      tool?.update({ level: 'ERROR', statusMessage: message });
+      tool?.end();
+      throw err;
+    }
+  }
+
+  /** Sets the human-meaningful output on the turn's root observation. */
+  private setTurnOutput(
+    span: TraceObservation | null,
+    response: ChatResponse,
+  ): void {
+    span?.update({
+      output: {
+        message: response.message,
+        stopReason: response.stopReason,
+        iterations: response.iterations,
+        awaitedApproval: response.awaitingApproval !== undefined,
+      },
+    });
+  }
+
+  /**
    * Loads a conversation owned by the active tenant and returns its persisted
    * message history. Cross-tenant or missing ids fail closed (404).
    */
@@ -306,6 +528,7 @@ export class AgentService {
     return {
       id: conversation.id,
       messages: this.conversations.toMessages(conversation.messages),
+      version: conversation.version as number | undefined,
     };
   }
 
@@ -418,7 +641,11 @@ export class AgentService {
       for (const tc of mutating) {
         acc.toolCalls.push(tc);
 
-        const result = await this.registry.execute(tc.name, tc.arguments);
+        const result = await this.executeTracedTool(
+          tc.name,
+          tc.arguments,
+          tc.id,
+        );
         acc.toolResults.push({
           id: tc.id,
           name: tc.name,
@@ -482,11 +709,10 @@ export class AgentService {
     if (readOnly.length === 0) return;
 
     const results = await Promise.allSettled(
-      readOnly.map((tc) =>
-        this.registry
-          .execute(tc.name, tc.arguments)
-          .then((r) => ({ tc, result: r })),
-      ),
+      readOnly.map(async (tc) => ({
+        tc,
+        result: await this.executeTracedTool(tc.name, tc.arguments, tc.id),
+      })),
     );
 
     for (const settled of results) {
@@ -557,18 +783,41 @@ export class AgentService {
     let lastError: Error | undefined;
 
     for (let attempt = 1; attempt <= this.maxRetries; attempt++) {
+      const generation = this.tracing.startLlmCall('llm-call', {
+        model: ENV.LLM_MODEL,
+        input: { system, messages, tools },
+      });
       try {
-        return await this.llm.complete({
+        const response = await this.llm.complete({
           model: ENV.LLM_MODEL,
           system,
           messages,
           tools,
         });
+        generation?.update({
+          model: response.model,
+          output: {
+            content: response.content,
+            toolCalls: response.toolCalls,
+            stopReason: response.stopReason,
+          },
+          usageDetails: {
+            input: response.usage.inputTokens,
+            output: response.usage.outputTokens,
+          },
+        });
+        generation?.end();
+        return response;
       } catch (err) {
         lastError = err instanceof Error ? err : new Error(String(err));
         this.logger.warn(
           `LLM call failed (attempt ${attempt}/${this.maxRetries}, ${contextLabel}): ${lastError.message}`,
         );
+        generation?.update({
+          level: 'ERROR',
+          statusMessage: lastError.message,
+        });
+        generation?.end();
 
         if (attempt < this.maxRetries) {
           // Exponential backoff: 500ms, 1000ms, ...
