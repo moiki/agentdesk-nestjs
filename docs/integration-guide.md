@@ -44,7 +44,7 @@ curl -sX POST $API/chat/approve -H "Authorization: Bearer $TOKEN" \
 
 | Endpoint | Auth | Body | Respuesta |
 |---|---|---|---|
-| `POST /signup` | — | `{ companyName, workspaceName, adminEmail, adminPassword, plan? }` | `201 { tenantId, adminUserId, plan }` |
+| `POST /signup` | — | `{ companyName, workspaceName, adminEmail, adminPassword, plan?, industry?, companyDescription?, supportEmail?, supportPhone?, brandVoice?, defaultLanguage? }` | `201 { tenantId, adminUserId, plan }` |
 | `POST /auth/login` | — | `{ email, password }` | `200 { accessToken }` |
 | `GET /auth/me` | Bearer | — | `200 { user, tenant }` |
 
@@ -53,6 +53,7 @@ Reglas:
 - `workspaceName`: slug `^[a-z0-9][a-z0-9-]{1,38}[a-z0-9]$` (2–40 chars).
 - Email o workspace duplicado → `409 Conflict`.
 - Envía `Authorization: Bearer <accessToken>` en todo endpoint marcado *auth*.
+- Los campos de contexto (`industry`, `companyDescription`, `supportEmail`, `supportPhone`, `brandVoice`, `defaultLanguage`) son **opcionales**; se usan para generar el system prompt de ese tenant (ver §5).
 
 ## 3. Convenciones transversales
 
@@ -82,17 +83,21 @@ recarga.
 ```jsonc
 // Request (primer mensaje — sin conversationId)
 {
-  "message": "¿Qué tickets hay abiertos?",
-  "systemPrompt": "Eres soporte de Acme..."   // opcional
+  "message": "¿Qué tickets hay abiertos?"
 }
 
 // Request (continuar — con conversationId de la respuesta anterior)
 {
   "message": "Ahora elimina el de la fila de arriba",
-  "conversationId": "uuid-de-la-conversacion",
-  "systemPrompt": "Eres soporte de Acme..."   // opcional
+  "conversationId": "uuid-de-la-conversacion"
 }
 ```
+
+> **System prompt por tenant:** el backend compone automáticamente el prompt de
+> cada agente combinando la identidad de AgentDesk con el contexto de la compañía
+> recopilado en el signup. El **cliente ya no puede sobrescribir** la identidad del
+> agente. El campo opcional `systemPrompt` se trata como **instrucciones extra**
+> (máx. 2000 chars) que se añaden al prompt del tenant, nunca lo reemplazan.
 
 ```jsonc
 // Response — ChatResponse
