@@ -59,15 +59,12 @@ async function main(): Promise<number> {
       // Phase 2 — human approves → tool runs once → end_turn. The harness
       // resumes the persisted conversation (conversationId), so no client
       // state needs to be replayed.
-      const final = await agent.approve(
-        paused.conversationId,
-        [
-          {
-            toolCallId: paused.awaitingApproval.toolCalls[0].id,
-            approved: true,
-          },
-        ],
-      );
+      const final = await agent.approve(paused.conversationId, [
+        {
+          toolCallId: paused.awaitingApproval.toolCalls[0].id,
+          approved: true,
+        },
+      ]);
       console.log('▶️  Phase 2 stopReason:', final.stopReason);
       console.log('💬 Model:', final.message);
       console.log('🔧 toolResults:', JSON.stringify(final.toolResults));

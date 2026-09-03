@@ -185,7 +185,10 @@ describe('Auth flow (e2e)', () => {
     await signupAndAuth(httpServer, { email, workspaceName });
 
     const agent = request.agent(httpServer);
-    await agent.post('/auth/login').send({ email, password: 'password123' }).expect(200);
+    await agent
+      .post('/auth/login')
+      .send({ email, password: 'password123' })
+      .expect(200);
 
     const me = await agent.get('/auth/me').expect(200);
     expect(me.body.email).toBe(email);
@@ -198,7 +201,10 @@ describe('Auth flow (e2e)', () => {
     await signupAndAuth(httpServer, { email, workspaceName });
 
     const agent = request.agent(httpServer);
-    await agent.post('/auth/login').send({ email, password: 'password123' }).expect(200);
+    await agent
+      .post('/auth/login')
+      .send({ email, password: 'password123' })
+      .expect(200);
 
     const refreshRes = await agent.post('/auth/refresh').expect(200);
     expect(refreshRes.body.accessToken).toBeDefined();
