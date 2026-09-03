@@ -14,6 +14,9 @@ import { ToolRegistry } from './tools/tool-registry.service';
 import { ConversationService } from './conversation.service';
 import { ConversationStatus } from '../generated/prisma/client';
 import { getTenantContext } from '../tenancy/tenant-context';
+import { TenantScopedPrismaService } from '../tenancy/tenant-scoped-prisma.service';
+import { TenantPromptService } from './prompts/tenant-prompt.service';
+import type { TenantPromptContext } from './prompts/tenant-prompt.types';
 
 export interface ToolCallResult {
   id: string;
@@ -53,14 +56,6 @@ interface LoopAccumulators {
   iterations: number;
 }
 
-const DEFAULT_SYSTEM_PROMPT = `You are AgentDesk, an AI support agent. You help users manage their support tickets.
-You can create, list, search, update, and delete tickets. Always be helpful and concise.
-When a user asks you to do something with tickets, use the appropriate tool.
-When a tool returns an error, analyze the error code:
-- NOT_FOUND: the resource doesn't exist, try a different ID or ask the user
-- VALIDATION_ERROR: fix the input and retry
-- INTERNAL_ERROR: do NOT retry, tell the user something went wrong on our end`;
-
 function getUserId(): string | undefined {
   return getTenantContext()?.userId;
 }
@@ -69,7 +64,6 @@ function getUserId(): string | undefined {
 export class AgentService {
   private readonly logger = new Logger(AgentService.name);
   private readonly budget: LoopBudget;
-  private readonly defaultSystemPrompt: string;
   private readonly maxRetries: number;
 
   constructor(
@@ -77,13 +71,14 @@ export class AgentService {
     private readonly registry: ToolRegistry,
     private readonly eventEmitter: EventEmitter2,
     private readonly conversations: ConversationService,
+    private readonly tenantPrompts: TenantPromptService,
+    private readonly scopedPrisma: TenantScopedPrismaService,
   ) {
     this.budget = {
       maxIterations: ENV.AGENT_MAX_ITERATIONS,
       maxTotalTokens: ENV.AGENT_MAX_TOTAL_TOKENS,
       maxWallClockMs: ENV.AGENT_MAX_WALL_CLOCK_MS,
     };
-    this.defaultSystemPrompt = ENV.AGENT_SYSTEM_PROMPT || DEFAULT_SYSTEM_PROMPT;
     this.maxRetries = ENV.AGENT_LLM_MAX_RETRIES;
   }
 
@@ -110,17 +105,27 @@ export class AgentService {
     const messages: ChatMessage[] = [
       ...(conversationHistory && !conversationId
         ? conversationHistory
-        : existing.messages ?? []),
+        : (existing.messages ?? [])),
       { role: 'user', content: userMessage },
     ];
 
-    return this.runLoop(messages, systemPrompt ?? this.defaultSystemPrompt, {
-      toolCalls: [],
-      toolResults: [],
-      usage: { inputTokens: 0, outputTokens: 0 },
-      iterations: 0,
-    }, conversationID, (next, status) =>
-      this.conversations.updateMessages(conversationID, next, status),
+    // The system prompt is composed per-tenant by the server. A client-supplied
+    // 'systemPrompt' is treated as optional, capped extra instructions only —
+    // it can no longer hijack the agent's identity.
+    const system = await this.resolveSystemPrompt(systemPrompt);
+
+    return this.runLoop(
+      messages,
+      system,
+      {
+        toolCalls: [],
+        toolResults: [],
+        usage: { inputTokens: 0, outputTokens: 0 },
+        iterations: 0,
+      },
+      conversationID,
+      (next, status) =>
+        this.conversations.updateMessages(conversationID, next, status),
     );
   }
 
@@ -238,12 +243,58 @@ export class AgentService {
 
     return this.runLoop(
       messages,
-      this.defaultSystemPrompt,
+      await this.resolveSystemPrompt(),
       acc,
       conversationId,
       (next, status) =>
         this.conversations.updateMessages(conversationId, next, status),
     );
+  }
+
+  /**
+   * Composes the system prompt for the current tenant (identity base + tenant
+   * context) and appends optional, capped client extra instructions.
+   *
+   * Uses the active tenant from AsyncLocalStorage. When there is no tenant
+   * context or the Tenant row cannot be loaded, it degrades gracefully to the
+   * identity base — the loop never fails because prompt composition failed.
+   */
+  private async resolveSystemPrompt(
+    extraInstructions?: string,
+  ): Promise<string> {
+    const tenantId = getTenantContext()?.tenantId;
+    let ctx: TenantPromptContext | null = null;
+
+    if (tenantId) {
+      try {
+        const tenant = await this.scopedPrisma.prisma.tenant.findUnique({
+          where: { id: tenantId },
+        });
+        if (tenant) {
+          ctx = {
+            id: tenant.id,
+            name: tenant.name,
+            domain: tenant.slug,
+            plan: tenant.plan,
+            industry: tenant.industry,
+            companyDescription: tenant.companyDescription,
+            supportEmail: tenant.supportEmail,
+            supportPhone: tenant.supportPhone,
+            brandVoice: tenant.brandVoice,
+            defaultLanguage: tenant.defaultLanguage,
+          };
+        }
+      } catch (err) {
+        this.logger.warn(
+          `Failed to load tenant context for prompt (${tenantId}): ${
+            err instanceof Error ? err.message : String(err)
+          }`,
+        );
+      }
+    }
+
+    const base = this.tenantPrompts.buildForTenant(ctx);
+    return this.tenantPrompts.appendExtraInstructions(base, extraInstructions);
   }
 
   /**

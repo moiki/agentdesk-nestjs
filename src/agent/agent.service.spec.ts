@@ -9,6 +9,9 @@ import type { ChatMessage } from '../llm/llm.types';
 import { EventEmitter2 } from '@nestjs/event-emitter';
 import { ConversationService } from './conversation.service';
 import { ConversationStatus } from '../generated/prisma/client';
+import { TenantPromptService } from './prompts/tenant-prompt.service';
+import { TenantScopedPrismaService } from '../tenancy/tenant-scoped-prisma.service';
+import { DEFAULT_IDENTITY_PROMPT } from './prompts/identity.prompt';
 
 /**
  * In-memory stand-in for the real ConversationService so unit tests never touch
@@ -102,6 +105,10 @@ describe('AgentService', () => {
     eventEmitter = new EventEmitter2();
     conversations = new FakeConversationService();
 
+    // No tenant context is set in these unit tests, so the tenant prompt
+    // resolver takes the no-DB path. These fakes let Nest resolve DI.
+    const fakeScopedPrisma = {} as unknown as TenantScopedPrismaService;
+
     module = await Test.createTestingModule({
       providers: [
         AgentService,
@@ -109,6 +116,8 @@ describe('AgentService', () => {
         { provide: ToolRegistry, useValue: registry },
         { provide: EventEmitter2, useValue: eventEmitter },
         { provide: ConversationService, useValue: conversations },
+        TenantPromptService,
+        { provide: TenantScopedPrismaService, useValue: fakeScopedPrisma },
       ],
     }).compile();
 
@@ -372,11 +381,23 @@ describe('AgentService', () => {
     expect(result.message).toContain('approval');
   });
 
-  it('uses custom system prompt when provided', async () => {
+  it('appends client extra instructions to the identity prompt (not a full override)', async () => {
     fakeLlm.add({ match: {}, response: endTurnResponse('ok') });
 
-    await agent.chat('hi', undefined, 'Custom prompt');
-    expect(fakeLlm.requests[0].system).toBe('Custom prompt');
+    await agent.chat('hi', undefined, 'Speak briefly.');
+    const system = fakeLlm.requests[0].system;
+    expect(system).toContain('You are AgentDesk');
+    expect(system).toContain('## Additional instructions');
+    expect(system).toContain('Speak briefly.');
+    // The client prompt must NOT replace the identity base.
+    expect(system).not.toBe('Speak briefly.');
+  });
+
+  it('uses the default AgentDesk identity prompt when no extra instructions are given', async () => {
+    fakeLlm.add({ match: {}, response: endTurnResponse('ok') });
+
+    await agent.chat('hi');
+    expect(fakeLlm.requests[0].system).toContain(DEFAULT_IDENTITY_PROMPT);
   });
 
   it('includes conversation history in the request', async () => {
@@ -616,9 +637,7 @@ describe('AgentService', () => {
       ]);
 
       expect(result.toolResults).toHaveLength(2);
-      const byId = Object.fromEntries(
-        result.toolResults.map((r) => [r.id, r]),
-      );
+      const byId = Object.fromEntries(result.toolResults.map((r) => [r.id, r]));
       expect(byId['a1'].success).toBe(true);
       expect(byId['a2']).toMatchObject({
         success: false,

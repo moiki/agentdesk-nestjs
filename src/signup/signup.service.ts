@@ -46,6 +46,12 @@ export class SignupService {
               name: dto.companyName,
               slug: dto.workspaceName,
               plan: dto.plan ?? 'FREE',
+              industry: dto.industry,
+              companyDescription: dto.companyDescription,
+              supportEmail: dto.supportEmail,
+              supportPhone: dto.supportPhone,
+              brandVoice: dto.brandVoice,
+              defaultLanguage: dto.defaultLanguage ?? 'es',
             },
           });
 

@@ -41,6 +41,16 @@ model Tenant {
   name      String
   slug      String   @unique
   plan      Plan     @default(FREE)
+
+  // Company context captured during signup. Used to build the per-tenant
+  // system prompt (industry, what the company does, support channels, voice).
+  industry           String?
+  companyDescription String?
+  supportEmail       String?
+  supportPhone       String?
+  brandVoice         String?
+  defaultLanguage    String   @default("es")
+
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
