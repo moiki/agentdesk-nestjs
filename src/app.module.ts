@@ -10,6 +10,7 @@ import { PrismaModule } from './prisma/prisma.module';
 import { SignupModule } from './signup/signup.module';
 import { TenancyModule } from './tenancy/tenancy.module';
 import { TicketsModule } from './tickets/tickets.module';
+import { TracingModule } from './tracing/tracing.module';
 
 @Module({
   imports: [
@@ -23,6 +24,7 @@ import { TicketsModule } from './tickets/tickets.module';
     TicketsModule,
     LlmModule,
     AgentModule,
+    TracingModule,
   ],
   controllers: [HealthController],
   providers: [{ provide: APP_GUARD, useClass: ThrottlerGuard }],

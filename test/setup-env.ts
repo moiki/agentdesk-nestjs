@@ -9,6 +9,9 @@ if (process.env.TEST_DATABASE_URL) {
 // Tests never talk to a real LLM.
 process.env.LLM_PROVIDER = 'fake';
 
+// Never boot OpenTelemetry/Langfuse in tests (`.env` carries real creds).
+process.env.LANGFUSE_ENABLED = 'false';
+
 // Deterministic JWT secret + generous rate limit so suites never throttle.
 process.env.JWT_SECRET = 'test-secret';
 process.env.THROTTLE_LIMIT = '10000';

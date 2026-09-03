@@ -54,6 +54,15 @@ export const ENV = {
   GROQ_BASE_URL: process.env.GROQ_BASE_URL ?? 'https://api.groq.com/openai/v1',
   GROQ_MODEL: process.env.GROQ_MODEL ?? 'openai/gpt-oss-120b',
 
+  // Langfuse observability. Tracing is opt-in (LANGFUSE_ENABLED=true) so that
+  // dev/test environments stay silent unless explicitly switched on. The
+  // LangfuseSpanProcessor reads credentials from the standard LANGFUSE_* vars.
+  LANGFUSE_ENABLED: process.env.LANGFUSE_ENABLED === 'true',
+  LANGFUSE_PUBLIC_KEY: process.env.LANGFUSE_PUBLIC_KEY ?? '',
+  LANGFUSE_SECRET_KEY: process.env.LANGFUSE_SECRET_KEY ?? '',
+  LANGFUSE_BASE_URL:
+    process.env.LANGFUSE_BASE_URL ?? 'https://cloud.langfuse.com',
+
   AGENT_MAX_ITERATIONS: Number(process.env.AGENT_MAX_ITERATIONS ?? 10),
   AGENT_MAX_TOTAL_TOKENS: Number(process.env.AGENT_MAX_TOTAL_TOKENS ?? 200_000),
   AGENT_MAX_WALL_CLOCK_MS: Number(

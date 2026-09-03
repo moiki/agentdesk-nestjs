@@ -6,8 +6,13 @@ import helmet from 'helmet';
 import compression from 'compression';
 import { AppModule } from './app.module';
 import { ENV } from './common/constants';
+import { setupTracing } from './tracing/tracing.setup';
 
 async function bootstrap() {
+  // Langfuse/OpenTelemetry must be registered before the Nest app boots so the
+  // tracer is ready for the first agent turn. No-op when LANGFUSE_ENABLED unset.
+  setupTracing();
+
   const app = await NestFactory.create(AppModule);
 
   // Global security headers (CSP, HSTS, X-Content-Type-Options, etc.)
