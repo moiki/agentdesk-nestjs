@@ -9,6 +9,7 @@ import { LlmModule } from './llm/llm.module';
 import { PrismaModule } from './prisma/prisma.module';
 import { SignupModule } from './signup/signup.module';
 import { TenancyModule } from './tenancy/tenancy.module';
+import { TenantModule } from './tenant/tenant.module';
 import { TicketsModule } from './tickets/tickets.module';
 import { TracingModule } from './tracing/tracing.module';
 
@@ -21,6 +22,7 @@ import { TracingModule } from './tracing/tracing.module';
     TenancyModule,
     AuthModule,
     SignupModule,
+    TenantModule,
     TicketsModule,
     LlmModule,
     AgentModule,

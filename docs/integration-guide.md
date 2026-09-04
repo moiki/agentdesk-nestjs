@@ -47,6 +47,14 @@ curl -sX POST $API/chat/approve -H "Authorization: Bearer $TOKEN" \
 | `POST /signup` | — | `{ companyName, workspaceName, adminEmail, adminPassword, plan?, industry?, companyDescription?, supportEmail?, supportPhone?, brandVoice?, defaultLanguage? }` | `201 { tenantId, adminUserId, plan }` |
 | `POST /auth/login` | — | `{ email, password }` | `200 { accessToken }` |
 | `GET /auth/me` | Bearer | — | `200 { user, tenant }` |
+| `GET /tenant/profile` | Bearer | — | `200 TenantProfile` (datos del tenant + métricas) |
+
+> **`GET /tenant/profile`** devuelve los datos completos del tenant del token
+> (`id, name, slug, plan, industry, companyDescription, supportEmail,
+> supportPhone, brandVoice, defaultLanguage, createdAt`) más `metrics` con
+> conteos en vivo: `{ ticketCount, openTicketCount, conversationCount,
+> memberCount }`. Útil para una vista de perfil del workspace.
+
 
 Reglas:
 - **El token es la única identidad de tenant** — no hay header `x-tenant-id`; jamás lo necesitas.
